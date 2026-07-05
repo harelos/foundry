@@ -1,0 +1,262 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Mission Control</title>
+<style>
+  :root {
+    --bg:#0c0e14; --panel:#151823; --panel2:#1c2030; --line:#262b3d;
+    --text:#e6e8f0; --muted:#8b91a7; --accent:#7c5cff; --accent2:#00d4a0;
+    --user:#2a2f45; --tool:#1a2433; --err:#ff5d6c; --gold:#ffcc66; --dir:#ffb454;
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--text);
+    font:14px/1.5 -apple-system,"Segoe UI",system-ui,sans-serif; height:100vh; display:flex; flex-direction:column; }
+
+  header { display:flex; align-items:center; gap:12px; padding:10px 16px;
+    background:linear-gradient(90deg,#14162200,#1b1f33); border-bottom:1px solid var(--line);
+    flex-shrink:0; flex-wrap:wrap; }
+  header h1 { font-size:15px; margin:0; font-weight:700; letter-spacing:.3px; }
+  .spacer { flex:1; }
+  select, input, textarea { font:inherit; }
+  select.sel, input.in { background:#0d1018; color:var(--text); border:1px solid var(--line);
+    border-radius:8px; padding:7px 9px; outline:none; }
+  select.sel:focus, input.in:focus { border-color:var(--accent); }
+  button { background:var(--accent); color:#fff; border:0; border-radius:8px;
+    padding:8px 13px; font-size:13px; font-weight:600; cursor:pointer; transition:filter .15s,opacity .15s; }
+  button:hover { filter:brightness(1.12); }
+  button:disabled { opacity:.45; cursor:not-allowed; }
+  button.ghost { background:var(--panel2); color:var(--text); border:1px solid var(--line); }
+  button.sm { padding:5px 9px; font-size:12px; }
+
+  #dash { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  .stat { background:#0d1018; border:1px solid var(--line); border-radius:8px; padding:5px 9px; font-size:12px; }
+  .stat b { color:var(--text); font-variant-numeric:tabular-nums; }
+  .stat .k { color:var(--muted); margin-right:5px; }
+  #budgetInput { width:62px; background:#0d1018; color:var(--text); border:1px solid var(--line); border-radius:6px; padding:3px 5px; }
+
+  .toggle { display:flex; border:1px solid var(--line); border-radius:8px; overflow:hidden; }
+  .toggle button { background:var(--panel2); color:var(--muted); border-radius:0; }
+  .toggle button.on { background:var(--accent); color:#fff; }
+
+  /* Project sub-bar */
+  #projbar { display:flex; align-items:center; gap:10px; padding:8px 16px; border-bottom:1px solid var(--line);
+    background:var(--panel); flex-shrink:0; flex-wrap:wrap; }
+  #projbar .pname { font-weight:700; }
+  #projbar .pcwd { color:var(--muted); font-size:12px; }
+  .files { display:flex; gap:6px; flex-wrap:wrap; align-items:center; }
+  .chip { background:var(--tool); color:var(--gold); font-size:11px; border-radius:12px; padding:3px 9px; display:flex; align-items:center; gap:6px; }
+  .chip .rm { cursor:pointer; color:var(--muted); } .chip .rm:hover { color:var(--err); }
+
+  #main { flex:1; overflow:auto; }
+  #grid { display:grid; gap:14px; padding:14px; grid-template-columns:repeat(auto-fill,minmax(380px,1fr)); align-content:start; }
+
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:12px; display:flex; flex-direction:column;
+    min-height:460px; max-height:80vh; overflow:hidden; }
+  .card.director { border-color:var(--dir); box-shadow:0 0 0 1px var(--dir) inset; }
+  .card-head { display:flex; align-items:center; gap:8px; padding:9px 11px; border-bottom:1px solid var(--line);
+    background:var(--panel2); flex-shrink:0; flex-wrap:wrap; }
+  .num { background:var(--accent); color:#fff; font-weight:700; font-size:11px; border-radius:6px; padding:1px 6px; }
+  .card.director .num { background:var(--dir); color:#2a1c00; }
+  .role { font-weight:700; }
+  .reports { font-size:11px; color:var(--muted); }
+  .model-sel { background:#0d1018; color:var(--text); border:1px solid var(--line); border-radius:6px; padding:3px 5px; font-size:12px; }
+  .badge { font-size:11px; color:var(--muted); background:#0d1018; padding:2px 7px; border-radius:6px; }
+  .badge.live { color:var(--accent2); }
+  .ic { background:transparent; color:var(--muted); padding:3px 6px; } .ic:hover { color:var(--text); }
+  .ic.x:hover { color:var(--err); }
+  .tok { width:100%; font-size:11px; color:var(--muted); font-variant-numeric:tabular-nums; }
+  .tok b { color:var(--text); }
+
+  .transcript { flex:1; overflow-y:auto; padding:12px; display:flex; flex-direction:column; gap:10px; }
+  .msg { padding:9px 12px; border-radius:10px; white-space:pre-wrap; word-break:break-word; }
+  .msg.user { background:var(--user); align-self:flex-end; max-width:88%; }
+  .msg.assistant { background:var(--panel2); border:1px solid var(--line); align-self:flex-start; max-width:96%; }
+  .msg.tool { background:var(--tool); color:var(--muted); font-size:12px; font-family:ui-monospace,monospace; align-self:flex-start; max-width:96%; }
+  .msg.err { background:#2a1418; color:var(--err); align-self:flex-start; max-width:96%; }
+  .msg.system { background:transparent; color:var(--muted); font-size:11.5px; align-self:center; }
+  .thinking { color:var(--muted); font-style:italic; align-self:flex-start; }
+  .dots::after { content:''; animation:dots 1.2s steps(4,end) infinite; }
+  @keyframes dots { 0%{content:''} 25%{content:'.'} 50%{content:'..'} 75%{content:'...'} }
+
+  .dispatch { align-self:flex-start; max-width:96%; background:#161e2e; border:1px dashed var(--dir);
+    border-radius:10px; padding:8px 10px; display:flex; flex-direction:column; gap:6px; }
+  .dispatch .dh { font-size:11px; color:var(--dir); font-weight:700; }
+  .dispatch .row { display:flex; gap:8px; align-items:flex-start; }
+  .dispatch .row .to { font-weight:700; color:var(--accent2); white-space:nowrap; }
+  .dispatch .row .task { flex:1; font-size:12.5px; color:var(--text); }
+  .dispatch .row button { background:var(--dir); color:#2a1c00; }
+  .dispatch .row button.done { background:var(--panel2); color:var(--muted); }
+
+  .attachments { display:flex; flex-wrap:wrap; gap:6px; padding:0 10px; }
+  .composer { display:flex; gap:8px; padding:10px; border-top:1px solid var(--line); flex-shrink:0; align-items:flex-end; }
+  .composer .attach { background:var(--panel2); color:var(--text); border:1px solid var(--line); padding:8px 10px; }
+  .composer textarea { flex:1; resize:none; background:#0d1018; color:var(--text); border:1px solid var(--line);
+    border-radius:8px; padding:8px 10px; max-height:120px; outline:none; }
+  .composer textarea:focus { border-color:var(--accent); }
+
+  .broadcast { display:flex; gap:8px; padding:11px 14px; border-top:1px solid var(--line); background:var(--panel); flex-shrink:0; }
+  .broadcast input { flex:1; background:#0d1018; color:var(--text); border:1px solid var(--line); border-radius:8px; padding:10px 12px; outline:none; }
+  .broadcast button { background:var(--accent2); color:#04201a; }
+  .stopbtn { background:var(--err) !important; color:#fff; }
+
+  .empty { color:var(--muted); text-align:center; margin:60px auto; max-width:460px; }
+  .empty h2 { color:var(--text); }
+
+  /* Org chart */
+  #diagram { padding:24px; overflow:auto; }
+  .tree, .tree ul { display:flex; flex-direction:column; align-items:center; }
+  .tree ul { flex-direction:row; justify-content:center; padding-top:22px; position:relative; }
+  .tree li { list-style:none; text-align:center; position:relative; padding:22px 10px 0; }
+  .tree li::before, .tree li::after { content:''; position:absolute; top:0; right:50%; border-top:2px solid var(--line); width:50%; height:22px; }
+  .tree li::after { right:auto; left:50%; border-left:2px solid var(--line); }
+  .tree li:only-child::after, .tree li:only-child::before { display:none; }
+  .tree li:only-child { padding-top:0; }
+  .tree li:first-child::before, .tree li:last-child::after { border:0 none; }
+  .tree li:last-child::before { border-right:2px solid var(--line); border-radius:0 6px 0 0; }
+  .tree li:first-child::after { border-radius:6px 0 0 0; }
+  .tree ul ul::before { content:''; position:absolute; top:0; left:50%; border-left:2px solid var(--line); width:0; height:22px; }
+  .node { display:inline-block; background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:10px 14px; min-width:150px; cursor:pointer; }
+  .node:hover { border-color:var(--accent); }
+  .node.director { border-color:var(--dir); }
+  .node .nr { font-weight:700; cursor:pointer; }
+  .node .nr:hover { color:var(--accent2); }
+  .node .nn { font-size:11px; color:var(--muted); }
+  .node .nt { font-size:11px; color:var(--accent2); margin-top:3px; }
+  .node .ntools { display:flex; gap:4px; justify-content:center; margin-top:7px; }
+  .node .ntools button { padding:3px 7px; font-size:11px; background:var(--panel2); color:var(--text); border:1px solid var(--line); border-radius:6px; }
+  .node .ntools button:hover { border-color:var(--accent); }
+  .node .rsel { margin-top:6px; font-size:11px; background:#0d1018; color:var(--muted); border:1px solid var(--line); border-radius:6px; padding:2px 4px; max-width:170px; }
+  #diagram .dhint { color:var(--muted); font-size:12px; text-align:center; margin-bottom:16px; }
+  .diag-actions { text-align:center; margin-top:18px; }
+
+  /* Modal */
+  .modal { position:fixed; inset:0; background:#000a; display:none; align-items:center; justify-content:center; z-index:50; padding:20px; }
+  .modal.open { display:flex; }
+  .sheet { background:var(--panel); border:1px solid var(--line); border-radius:14px; width:100%; max-width:640px; max-height:88vh; overflow:auto; padding:20px; }
+  .sheet h3 { margin:0 0 14px; }
+  .field { display:flex; flex-direction:column; gap:5px; margin-bottom:12px; }
+  .field label { font-size:12px; color:var(--muted); }
+  .field input, .field select, .field textarea { background:#0d1018; color:var(--text); border:1px solid var(--line); border-radius:8px; padding:8px 10px; outline:none; }
+  .field textarea { min-height:120px; resize:vertical; }
+  .modal-actions { display:flex; gap:8px; justify-content:flex-end; margin-top:8px; }
+  .role-edit { border:1px solid var(--line); border-radius:10px; padding:12px; margin-bottom:10px; background:var(--panel2); }
+  .role-edit .top { display:flex; gap:8px; margin-bottom:8px; }
+  .role-edit .top input { flex:1; }
+  .tpl-row { display:flex; align-items:center; gap:8px; padding:8px; border:1px solid var(--line); border-radius:8px; margin-bottom:8px; }
+  .tpl-row .tn { font-weight:700; } .tpl-row .td { color:var(--muted); font-size:12px; flex:1; }
+  .hidden { display:none !important; }
+</style>
+</head>
+<body>
+  <header>
+    <h1>Mission Control</h1>
+    <select class="sel" id="projSelect" title="Active project"></select>
+    <button class="ghost sm" id="newProjBtn">+ Project</button>
+    <button class="ghost sm" id="tplBtn">Templates</button>
+    <div class="toggle">
+      <button id="viewChat" class="on">Team Chat</button>
+      <button id="viewDiagram">Diagram</button>
+    </div>
+    <div class="toggle" id="layoutBar">
+      <button data-layout="comfortable" class="on" title="Large cards">L</button>
+      <button data-layout="compact" title="Compact cards">M</button>
+      <button data-layout="dense" title="Dense — fit 20+">S</button>
+    </div>
+    <div class="spacer"></div>
+    <div id="dash">
+      <div class="stat"><span class="k">Agents</span><b id="sAgents">0</b></div>
+      <div class="stat"><span class="k">Tokens</span><b id="sTokens">0</b></div>
+      <div class="stat"><span class="k">Cost</span>$<b id="sCost">0.0000</b></div>
+      <div class="stat"><span class="k">Budget $</span><input id="budgetInput" type="number" step="0.5" min="0" placeholder="set" /> <span class="k">left $</span><b id="sLeft">—</b></div>
+    </div>
+  </header>
+
+  <div id="projbar">
+    <span class="pname" id="pName">No project</span>
+    <span class="pcwd" id="pCwd"></span>
+    <div class="files" id="pFiles"></div>
+    <button class="ghost sm" id="addFileBtn">📎 Shared file</button>
+    <input type="file" id="fileInput" multiple class="hidden" />
+    <div class="spacer"></div>
+    <button class="sm" id="addWorkerBtn">+ Worker</button>
+    <button class="ghost sm" id="saveTplBtn">Save as Template</button>
+  </div>
+
+  <div id="main">
+    <div id="grid"></div>
+    <div id="diagram" class="hidden"></div>
+  </div>
+
+  <div class="broadcast">
+    <input id="bcInput" placeholder="Broadcast a message to ALL agents in this project…" />
+    <button id="bcBtn">Send to all</button>
+  </div>
+
+  <!-- Modals -->
+  <div class="modal" id="projModal"><div class="sheet">
+    <h3>New Project</h3>
+    <div class="field"><label>Project name</label><input id="npName" placeholder="e.g. 99 Jerseys — Upsell" /></div>
+    <div class="field"><label>Working folder (where agents read/write files)</label><input id="npCwd" placeholder="C:\\Users\\..." /></div>
+    <div class="field"><label>Start from template</label><select id="npTemplate"></select></div>
+    <div class="modal-actions"><button class="ghost" data-close>Cancel</button><button id="npCreate">Create Project</button></div>
+  </div></div>
+
+  <div class="modal" id="workerModal"><div class="sheet">
+    <h3 id="wmTitle">Add Worker</h3>
+    <div class="field"><label>Name / Role title</label><input id="wmName" placeholder="e.g. Copywriter" /></div>
+    <div class="field"><label>Reports to</label><select id="wmReports"></select></div>
+
+    <div class="field"><label>Engine</label><select id="wmEngine">
+      <option value="claude-code">Claude Code — full tools (read/write files, run commands)</option>
+      <option value="api">Direct API — chat only, no tools (OpenAI-compatible)</option>
+    </select></div>
+
+    <!-- Claude Code settings -->
+    <div id="wmCcFields">
+      <div class="field"><label>Model</label><select id="wmModel"></select></div>
+      <div class="field"><label>Effort level</label><select id="wmEffort">
+        <option value="">Default</option>
+        <option value="low">Low — fast, concise</option>
+        <option value="medium">Medium — balanced</option>
+        <option value="high">High — thorough</option>
+        <option value="max">Max — exhaustive</option>
+      </select></div>
+      <details>
+        <summary style="cursor:pointer;color:var(--muted);font-size:12px;margin-bottom:8px">Advanced: run Claude Code on a non-Anthropic model via proxy (keeps tools)</summary>
+        <div class="field"><label>Proxy Base URL (ANTHROPIC_BASE_URL) — e.g. http://localhost:3456</label><input id="wmCcBase" placeholder="leave blank for normal Anthropic" /></div>
+        <div class="field"><label>Auth token / API key</label><input id="wmCcToken" placeholder="key your proxy expects" /></div>
+        <div class="field"><label>Model name override (as your proxy names it)</label><input id="wmCcModel" placeholder="e.g. gpt-4o, gemini-2.5-pro, deepseek-chat" /></div>
+      </details>
+    </div>
+
+    <!-- Direct API settings -->
+    <div id="wmApiFields" class="hidden">
+      <div class="field"><label>API Base URL (must end before /chat/completions)</label><input id="wmApiBase" placeholder="https://api.openai.com/v1" /></div>
+      <div class="field"><label>API Key</label><input id="wmApiKey" placeholder="sk-..." /></div>
+      <div class="field"><label>Model</label><input id="wmApiModel" placeholder="e.g. gpt-4o, llama-3.1-70b" /></div>
+    </div>
+
+    <div class="field"><label>Soul (.md persona — who they are, how they think, their rules)</label><textarea id="wmSoul" placeholder="You are a senior..."></textarea></div>
+    <div class="modal-actions"><button class="ghost" data-close>Cancel</button><button id="wmSave">Save</button></div>
+  </div></div>
+
+  <div class="modal" id="tplModal"><div class="sheet">
+    <h3>Templates</h3>
+    <div id="tplList"></div>
+    <div class="modal-actions"><button class="ghost" data-close>Close</button><button id="tplNew">+ New Template</button></div>
+  </div></div>
+
+  <div class="modal" id="tplEditModal"><div class="sheet">
+    <h3 id="teTitle">Edit Template</h3>
+    <div class="field"><label>Template name</label><input id="teName" /></div>
+    <div class="field"><label>Description</label><input id="teDesc" /></div>
+    <div id="teRoles"></div>
+    <button class="ghost sm" id="teAddRole">+ Add role</button>
+    <div class="modal-actions"><button class="ghost" data-close>Cancel</button><button id="teSave">Save Template</button></div>
+  </div></div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

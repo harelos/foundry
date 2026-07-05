@@ -1,0 +1,7 @@
+node_modules/
+mc-uploads/
+data.json
+data.json.bak
+templates.json
+*.log
+.env

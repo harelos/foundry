@@ -1,0 +1,13 @@
+{
+  "name": "mission-control",
+  "version": "2.1.0",
+  "description": "Multi-agent dashboard for Claude Code and any OpenAI-compatible LLM. Run 20+ agents simultaneously with per-agent model/provider selection.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "author": "",
+  "license": "MIT",
+  "private": true
+}
