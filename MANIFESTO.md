@@ -109,6 +109,6 @@ The fire is warm. The anvil is ready.
 
 Get to work.
 
-— Zvi, forgeman
+— Jacob, forgeman
 
 *[2026]*

@@ -73,7 +73,7 @@ turns it into a mid-funnel magnet:
 Founder discovers Foundry on GitHub/HN
   → runs it locally (~5 min setup, if you nail the README)
   → gets impressed
-  → sees "built by Zvi who also runs Agent Sales Machine" in the README
+  → sees "built by Jacob who also runs Agent Sales Machine" in the README
   → some fraction hires you for the Done-For-You service
 ```
 
@@ -214,7 +214,7 @@ network via the Agency).
       multi-agent workshop for solo operators (Claude Code + OpenAI +
       OpenClaw)"**. Choose a Tuesday 8am PT posting time.
 - [ ] Set up a Discord for the Founding Fold. Pin the manifesto.
-- [ ] Add "Built by Zvi — hire me / hire the Agency" footer to the README
+- [ ] Add "Built by Jacob — hire me / hire the Agency" footer to the README
       linking to your existing landing page
 
 ### Ongoing

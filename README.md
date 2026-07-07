@@ -231,7 +231,7 @@ product, at least name your fork something else.
 
 ## About the builder
 
-I'm Zvi — a direct-response marketer who spent years running DTC ecommerce
+I'm Jacob — a direct-response marketer who spent years running DTC ecommerce
 funnels before deciding I'd rather build the tools than keep paying for them.
 
 Foundry exists because every multi-agent framework I found (LangGraph, CrewAI,
@@ -256,6 +256,7 @@ short enough to read in one sitting.
 - **What I'm looking for:** remote roles in AI product, developer tools, or
   applied agent engineering. Open to contract or full-time.
 - **Reach me:** harel@adlersmedia.com
+- **Book 30 minutes:** [calendly.com/tigerbrandsglobal/30min](https://calendly.com/tigerbrandsglobal/30min)
 
 If Foundry is useful to you, a star helps other operators find it — and
 tells me it's worth continuing to build in public.
