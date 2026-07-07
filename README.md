@@ -10,7 +10,9 @@ warm-dark screen you own.
 
 Zero dependencies. Node built-ins only. No build step.
 
-![Foundry hero screenshot — replace with your own before publishing](docs/hero.png)
+<!-- TODO: drop a real screenshot at docs/hero.png and uncomment:
+![Foundry — a warm-dark command room for AI workers](docs/hero.png)
+-->
 
 ---
 
@@ -224,3 +226,36 @@ product, at least name your fork something else.
 ---
 
 **Foundry** · a warm workshop for people who ship.
+
+---
+
+## About the builder
+
+I'm Zvi — a direct-response marketer who spent years running DTC ecommerce
+funnels before deciding I'd rather build the tools than keep paying for them.
+
+Foundry exists because every multi-agent framework I found (LangGraph, CrewAI,
+AutoGen) was built for engineers who already know how to write a Python
+orchestration graph. I don't want to write a graph. I want to open a screen,
+hire a team, and ship a campaign before lunch. So I built the tool I needed —
+zero dependencies, one file per layer, no framework, warm interface instead
+of another cold enterprise dashboard.
+
+If you're hiring for **AI product**, **agent orchestration**, **developer
+tools**, or **applied LLM engineering** and you want someone who ships fast,
+designs with taste, and understands both the marketing side and the systems
+side of AI products — this repo is my proof of work. Read the code. It's
+short enough to read in one sitting.
+
+- **What I actually did here:** multi-engine agent runtime (Claude Code CLI +
+  any OpenAI-compatible API + OpenClaw), a custom protocol for dispatching
+  work between agents based on parsed structured output, a Node HTTP server
+  with zero npm dependencies, and a full design system built from primary
+  research (see `/docs` in the commit history for the research trail —
+  typography, color psychology, competitive UI teardowns, brand strategy).
+- **What I'm looking for:** remote roles in AI product, developer tools, or
+  applied agent engineering. Open to contract or full-time.
+- **Reach me:** harel@adlersmedia.com
+
+If Foundry is useful to you, a star helps other operators find it — and
+tells me it's worth continuing to build in public.
