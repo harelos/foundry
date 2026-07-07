@@ -1,63 +1,140 @@
-# Mission Control v2
+# Foundry
 
-Run a whole **department of Claude Code agents** on one screen. Projects, role-based
-teams with editable "souls", reusable templates, shared context files, an org-chart
-diagram, and Director-driven dispatch. No dependencies, no build step.
+**Forge a whole marketing department on one screen.**
 
-**Location:** `C:\Users\Lenovo\Desktop\mission-control`
+Foundry is a self-hosted control room for running a team of AI workers — copywriters,
+researchers, designers, developers, QA — each with their own persona, memory, and
+model. Send a brief to your Director, watch them break it into assignments, and
+click *Forge ▶* to dispatch every task to the right worker. All from one
+warm-dark screen you own.
 
-## Run it
+Zero dependencies. Node built-ins only. No build step.
 
-Double-click **`start.bat`** → opens http://localhost:4317.
-(Or `node server.js` and open that URL.)
+![Foundry hero screenshot — replace with your own before publishing](docs/hero.png)
+
+---
+
+## What it does
+
+- **Run 12+ AI workers in parallel** on a single project — each with their own
+  chat, token meter, and cost.
+- **Three engines per worker:** Claude Code (full file/shell tools), Direct API
+  (OpenAI-compatible chat), or OpenClaw (any model + browser autonomy).
+- **Director dispatch:** the Director role reads your brief, writes strategy,
+  and outputs an `ASSIGNMENTS:` list. Each assignment gets a *Forge ▶* button
+  that dispatches the task to the matching worker.
+- **12 built-in Blueprints** for common businesses: Marketing Department,
+  E-commerce Store (S/M), SaaS Startup (S/M), Content Studio, Solo Founder,
+  Agency, Coaching, Local Service, Real Estate, Google Play App team.
+- **Business size × goal parameters** at project creation (Small/Medium/Large ·
+  Launch/Scale/Retain/Hire) — the Director's persona gets biased accordingly.
+- **The Ledger:** daily / weekly / monthly / all-time token usage with plan-vs-API
+  cost separation.
+- **The Wire:** live activity feed showing every tool call, response, and error
+  across every worker.
+- **The Bell (⌘K):** command palette for every action — spawn workers, dispatch
+  missions, switch projects, open Blueprints.
+- **Shared context files** at project level (every worker reads them) and
+  drag-and-drop attachments at agent level.
+- **Save any session** as a Markdown transcript to your Projects folder.
+
+---
+
+## You need your own Claude account
+
+**Foundry does not include Claude API credits.** It's a UI on top of your own
+Claude Code installation (and optionally your own OpenAI / DeepSeek / Gemini
+keys for Direct API and OpenClaw workers).
+
+Before running Foundry, you need:
+
+1. **Claude Code** installed and logged into your own Anthropic account.
+   Install from https://docs.claude.com/claude-code.
+2. Node.js 18+ installed.
+3. (Optional) an OpenAI-compatible API key if you want to run *Direct API*
+   workers on GPT / Groq / DeepSeek / local Ollama.
+4. (Optional) OpenClaw installed if you want *OpenClaw* workers.
+   See https://github.com/openclaw.
+
+Your Claude usage is billed to *your* account. Foundry runs 100% locally on
+your machine.
+
+---
+
+## Install & run
+
+```bash
+git clone https://github.com/YOUR-USERNAME/foundry.git
+cd foundry
+node server.js
+```
+
+Then open http://localhost:4317.
+
+Or on Windows: double-click `start.bat`.
+
+**First run:** click *+ Project* → pick a Blueprint (e.g. Marketing Department) →
+give it a working folder → *Create Project*. You now have a team on the Floor.
+Focus a worker on the left rail, send them a message, and watch The Wire.
+
+---
+
+## Configure
+
+Environment variables (edit `start.bat` or export them):
+
+| Variable | Meaning | Default |
+|---|---|---|
+| `MC_PROJECT_DIR` | Default working folder for new projects | current directory |
+| `MC_PORT` | Web UI port | `4317` |
+| `MC_PERMISSION_MODE` | `bypassPermissions` / `acceptEdits` / `default` | `bypassPermissions` |
+
+`bypassPermissions` means agents act without asking (fastest for solo use).
+Change to `acceptEdits` or `default` for stricter workflows.
+
+---
 
 ## Core concepts
 
-- **Project** — a workspace with a working folder (where agents read/write files) and
-  **shared context files** every agent can see. Switch projects from the top dropdown.
-- **Worker (agent)** — a role with its own **soul** (`.md` persona), model, and a
-  "reports to" link. Each has its own chat, memory, and token meter.
-- **Template** — a reusable team blueprint. Ships with **Marketing Department**
-  (Director, Researcher, Copywriter, UI/UX Designer, Frontend Developer). Fully
-  editable: change names, souls, models, hierarchy — or save your own from any project.
+- **Project** — a workspace with a working folder (where agents read/write
+  files) and shared context files every worker can see. Switch projects from
+  the top-left dropdown.
+- **Worker** — a role with its own persona (soul.md), model, engine, and
+  reports-to link. Each has its own chat, session ID, and token meter.
+- **Blueprint** — a reusable team template (marketing, SaaS, e-commerce, etc.).
+  Fully editable — change names, souls, models, hierarchy. Save your own from
+  any project.
+- **The Anvil** — the dispatch panel that appears when a Director outputs
+  assignments. One click sends a task to the named worker.
+- **The Wire** — live activity feed on the right. Every tool call, message,
+  and error across every worker in one stream.
+- **The Ledger** — full history view (mission log + usage/billing).
+- **The Bell (⌘K)** — command palette. Hire, dispatch, save, switch, muster.
+- **Muster** — broadcast bar at the bottom. Send one prompt to every worker
+  in the project.
 
-## How a department works (Hybrid dispatch)
+---
 
-1. Create a project from the **Marketing Department** template.
-2. Add your spec/brief as a **shared file** (📎 Shared file) so the whole team has context.
-3. Message the **Director** with your goal.
-4. The Director replies with strategy + an **ASSIGNMENTS** list. Each assignment shows a
-   **Dispatch ▶** button — click it to send that task straight to the right worker.
-5. Work with each worker individually, or **Broadcast** to the whole team.
-
-## Features
-
-- **Diagram view** — org chart of the team (click a node to jump to its chat).
-- **Per-agent model** — Default / Opus 4.8 / Sonnet 4.6 / Haiku 4.5.
-- **Per-agent token + cost meter**, plus a session dashboard and optional **Budget**.
-- **Shared files** (project-wide) and **per-agent attachments** (📎 on a card).
-- **Edit soul** (✎ on a card) any time; **+ Worker** to add custom roles.
-- **Persistent** — projects, teams, and conversations are saved to `data.json` and
-  survive restarts (sessions resume by id). Templates live in `templates.json`.
-
-## Engines & non-Anthropic models (per agent)
+## Engines & non-Anthropic models
 
 Open ✎ on any worker and pick an **Engine**:
 
-- **Claude Code** (default) — full tools: reads/writes files, runs commands, builds the page.
-- **Direct API** — talks straight to any **OpenAI-compatible** endpoint (OpenAI,
-  OpenRouter, Groq, local LLMs). Set Base URL + Key + Model. **Chat only — no file tools.**
-  Good for Researcher/Copywriter/Director; not for building files.
+- **Claude Code** (default) — full tools: reads/writes files, runs commands,
+  builds the page. Uses your Claude account.
+- **Direct API** — talks to any OpenAI-compatible endpoint (OpenAI,
+  OpenRouter, Groq, DeepSeek, local Ollama). Chat only — no file tools. Good
+  for Researcher / Copywriter / Director roles that don't need to edit files.
+- **OpenClaw** — full autonomy + browser control, any model. Requires
+  OpenClaw installed separately.
 
 ### Want a non-Anthropic model that STILL has tools? Use the proxy.
 
-Claude Code speaks the Anthropic API, so to run it on GPT/Gemini/etc. *with tools intact*,
-put a small translator proxy in front. One-time setup:
+Claude Code speaks the Anthropic API. To run it on GPT / Gemini / DeepSeek
+with tools intact, put a translator proxy in front:
 
-```
-npm install -g @musistudio/claude-code-router    # or use LiteLLM
-# configure it with your OpenAI/OpenRouter/Gemini key, then start it:
-ccr start                                         # listens on http://localhost:3456
+```bash
+npm install -g @musistudio/claude-code-router
+ccr start                    # listens on http://localhost:3456
 ```
 
 Then on the agent (✎ → "Advanced: run Claude Code via proxy"):
@@ -65,29 +142,85 @@ Then on the agent (✎ → "Advanced: run Claude Code via proxy"):
 - **Auth token:** the key your proxy expects
 - **Model override:** e.g. `gpt-4o`, `gemini-2.5-pro`, `deepseek-chat`
 
-Now that agent keeps every Claude Code tool but thinks with the model you chose. You can
-mix freely — some agents on Claude, some on GPT, some on a local model.
+Mix freely — some workers on Claude, some on GPT, some on a local model.
 
-> Note: `data.json` stores API keys in plain text on your disk. It's a local-only tool;
-> don't share that file.
+---
 
-## Configure (edit `start.bat`)
+## Files & data
 
-| Variable | Meaning | Default |
-|---|---|---|
-| `MC_PROJECT_DIR` | Default working folder for new projects | flowmate-pro-final |
-| `MC_PORT` | Web UI port | 4317 |
-| `MC_PERMISSION_MODE` | `bypassPermissions` / `acceptEdits` / `default` | bypassPermissions |
-
-## Notes
-
-- `bypassPermissions` = agents act without asking. They share the project folder, so two
-  agents editing the same file at once can clobber each other.
-- "How much of my plan is left" isn't exposed by the Claude CLI — the dashboard shows
-  tokens + estimated $ used this session; set a Budget to track against it.
-- Local tool — don't expose the port to the internet.
 ```
-data.json       <- your projects, teams, and conversations (auto-saved)
-templates.json  <- your team templates (edit in-app)
-mc-uploads/     <- files you upload land here, inside each project's folder
+data.json          Your projects, workers, and conversations (auto-saved)
+templates.json     Your Blueprints (edit in-app or by hand)
+mc-uploads/        Files you attach land here, inside each project's folder
+public/            Front-end (index.html + app.js). No build step.
+server.js          Node.js server. Zero npm dependencies.
 ```
+
+Foundry never phones home. Everything is local.
+
+---
+
+## Security notes
+
+- **API keys are stored in plain text in `data.json`.** This is a local-only
+  tool. Do not share `data.json`, don't commit it, don't expose the port to
+  the internet. `.gitignore` already excludes it.
+- **`bypassPermissions` = agents act without asking.** Two agents editing the
+  same file at once can clobber each other. Use `acceptEdits` if you want a
+  confirmation step.
+- **Never expose port 4317 publicly.** No auth is built in — it's a personal
+  tool. If you need remote access, tunnel it (Tailscale, Cloudflare Tunnel)
+  with your own auth layer.
+
+---
+
+## The stack
+
+- **Backend:** Node.js built-ins only (`http`, `child_process`, `fs`). Zero npm
+  dependencies. One file: `server.js`.
+- **Frontend:** vanilla JavaScript + CSS. No React, no build. Two files:
+  `public/index.html` + `public/app.js`.
+- **Type stack:** Fraunces (display + hero numbers), Inter (body), IBM Plex
+  Mono (data). All free via Google Fonts.
+- **Motion:** AutoAnimate + CountUp.js loaded via CDN, only when the app needs
+  them.
+
+---
+
+## Contributing
+
+Foundry is opinionated by design — one warm-dark screen, one accent color,
+one type stack, one keyboard-first flow. PRs that change the aesthetic will be
+declined; PRs that fix bugs, add engines, or ship new Blueprints are welcome.
+
+- **Bugs:** open an issue with steps to reproduce.
+- **New Blueprint:** open a PR editing the `builtinTemplates()` function in
+  `server.js`. Include the business type, size, and goal biases in the
+  Director's soul.
+- **New engine:** open an issue first so we can talk architecture — the
+  `runTurn()` router in `server.js` is where engines plug in.
+
+---
+
+## Why "Foundry"?
+
+Because a solo operator running AI workers isn't running "Mission Control"
+(that's naval, distant, cold). They're running a *foundry* — a workshop where
+raw briefs get forged into copy, code, campaigns, and outputs. Warm, active,
+owned.
+
+The word is also our invitation. If you're the kind of operator who ships
+daily, refuses seat-license SaaS bloat, and would rather forge their own team
+than pay for enterprise seats, you're already in the tribe. Welcome to the
+Foundry.
+
+---
+
+## License
+
+MIT. See `LICENSE`. Do what you want with it. If you fork it into a paid
+product, at least name your fork something else.
+
+---
+
+**Foundry** · a warm workshop for people who ship.

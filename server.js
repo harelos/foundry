@@ -20,7 +20,7 @@ let state = { projects: [], activeProjectId: null, nextNum: 1 };
 let templates = [];
 const agents = new Map(); // id -> agent (runtime + persisted)
 
-function newTotals() { return { input: 0, output: 0, cache: 0, cost: 0, turns: 0 }; }
+function newTotals() { return { input: 0, output: 0, cache: 0, cost: 0, turns: 0, history: [] }; }
 
 // ---------- Persistence ----------
 function loadAll() {
@@ -33,6 +33,8 @@ function loadAll() {
       (d.agents || []).forEach((a) => {
         a.busy = false;
         a.totals = a.totals || newTotals();
+        if (!a.totals.history) a.totals.history = a.totalsHistory || [];
+        delete a.totalsHistory;
         agents.set(a.id, a);
       });
     }
@@ -65,7 +67,9 @@ function saveData() {
       model: a.model, effort: a.effort, reportsTo: a.reportsTo, projectId: a.projectId,
       cwd: a.cwd, sessionId: a.sessionId, totals: a.totals, primedSoul: a.primedSoul,
       engine: a.engine, apiBaseUrl: a.apiBaseUrl, apiKey: a.apiKey, apiModel: a.apiModel,
-      ccBaseUrl: a.ccBaseUrl, ccAuthToken: a.ccAuthToken, ccModel: a.ccModel, apiHistory: a.apiHistory || [],
+      ccBaseUrl: a.ccBaseUrl, ccAuthToken: a.ccAuthToken, ccModel: a.ccModel,
+      ocModel: a.ocModel, ocApiKey: a.ocApiKey, ocProvider: a.ocProvider, apiHistory: a.apiHistory || [],
+      totalsHistory: (a.totals && a.totals.history) || [],
     })),
   };
   try {
@@ -88,7 +92,8 @@ function publicAgent(a) {
            cwd: a.cwd, busy: a.busy, hasSession: !!a.sessionId, totals: a.totals,
            engine: a.engine || 'claude-code',
            apiBaseUrl: a.apiBaseUrl || '', apiKey: a.apiKey || '', apiModel: a.apiModel || '',
-           ccBaseUrl: a.ccBaseUrl || '', ccAuthToken: a.ccAuthToken || '', ccModel: a.ccModel || '' };
+           ccBaseUrl: a.ccBaseUrl || '', ccAuthToken: a.ccAuthToken || '', ccModel: a.ccModel || '',
+           ocModel: a.ocModel || '', ocApiKey: a.ocApiKey || '', ocProvider: a.ocProvider || '' };
 }
 function publicState() {
   return {
@@ -174,6 +179,7 @@ function createAgent(o) {
     engine: o.engine || 'claude-code', effort: o.effort || '',
     apiBaseUrl: o.apiBaseUrl || '', apiKey: o.apiKey || '', apiModel: o.apiModel || '',
     ccBaseUrl: o.ccBaseUrl || '', ccAuthToken: o.ccAuthToken || '', ccModel: o.ccModel || '',
+    ocModel: o.ocModel || '', ocApiKey: o.ocApiKey || '', ocProvider: o.ocProvider || '',
     sessionId: null, busy: false, totals: newTotals(), primedSoul: false, pendingContext: null,
     apiHistory: [],
   };
@@ -200,6 +206,7 @@ function stopAgent(agent) {
 
 function runTurn(agent, text, res) {
   if (agent.engine === 'api') return runApiTurn(agent, text, res);
+  if (agent.engine === 'openclaw') return runOpenClawTurn(agent, text, res);
 
   agent.busy = true;
   res.writeHead(200, { 'Content-Type': 'application/x-ndjson; charset=utf-8', 'Cache-Control': 'no-cache' });
@@ -280,11 +287,17 @@ function handleEvent(agent, evt, res) {
     }
   } else if (evt.type === 'result') {
     const u = evt.usage || {};
-    agent.totals.input += u.input_tokens || 0;
-    agent.totals.output += u.output_tokens || 0;
-    agent.totals.cache += (u.cache_read_input_tokens || 0) + (u.cache_creation_input_tokens || 0);
-    agent.totals.cost += evt.total_cost_usd || 0;
+    const inp = u.input_tokens || 0;
+    const out = u.output_tokens || 0;
+    const cac = (u.cache_read_input_tokens || 0) + (u.cache_creation_input_tokens || 0);
+    const cost = evt.total_cost_usd || 0;
+    agent.totals.input += inp;
+    agent.totals.output += out;
+    agent.totals.cache += cac;
+    agent.totals.cost += cost;
     agent.totals.turns += 1;
+    if (!agent.totals.history) agent.totals.history = [];
+    agent.totals.history.push({ ts: Date.now(), input: inp, output: out, cache: cac, cost, engine: agent.engine || 'claude-code' });
     send(res, { type: 'result', subtype: evt.subtype, cost: evt.total_cost_usd, duration: evt.duration_ms, totals: agent.totals });
   }
 }
@@ -324,9 +337,13 @@ async function runApiTurn(agent, text, res) {
       agent.apiHistory.push({ role: 'assistant', content });
       send(res, { type: 'text', text: content });
       const u = data.usage || {};
-      agent.totals.input += u.prompt_tokens || 0;
-      agent.totals.output += u.completion_tokens || 0;
+      const inp = u.prompt_tokens || 0;
+      const out = u.completion_tokens || 0;
+      agent.totals.input += inp;
+      agent.totals.output += out;
       agent.totals.turns += 1;
+      if (!agent.totals.history) agent.totals.history = [];
+      agent.totals.history.push({ ts: Date.now(), input: inp, output: out, cache: 0, cost: 0, engine: 'api' });
       agent.hasSession = true;
       agent.sessionId = agent.sessionId || ('api-' + agent.id);
       send(res, { type: 'result', subtype: 'success', cost: 0, totals: agent.totals });
@@ -343,6 +360,105 @@ async function runApiTurn(agent, text, res) {
   res.end();
 }
 
+// ---------- OpenClaw turn (full autonomy, any model) ----------
+async function runOpenClawTurn(agent, text, res) {
+  agent.busy = true;
+  res.writeHead(200, { 'Content-Type': 'application/x-ndjson; charset=utf-8', 'Cache-Control': 'no-cache' });
+
+  const provider = (agent.ocProvider || '').trim();
+  const model = (agent.ocModel || '').trim();
+  if (!provider || !model) {
+    send(res, { type: 'error', error: 'OpenClaw agent needs a Provider and Model (open ✎ Edit to set them).' });
+    agent.busy = false; send(res, { type: 'done' }); return res.end();
+  }
+
+  const fullModel = provider + '/' + model;
+
+  let toSend = text;
+  if (!agent.primedSoul) {
+    const persona = buildPersona(agent, { withContents: true });
+    if (persona) toSend = persona + '\n\n=== YOUR TASK ===\n' + text;
+    agent.primedSoul = true;
+  }
+
+  const env = { ...process.env };
+  const apiKey = (agent.ocApiKey || '').trim();
+  if (apiKey) {
+    const envName = provider.toUpperCase().replace(/[^A-Z0-9]/g, '_') + '_API_KEY';
+    env[envName] = apiKey;
+    if (provider === 'openai') env.OPENAI_API_KEY = apiKey;
+    else if (provider === 'anthropic') env.ANTHROPIC_API_KEY = apiKey;
+    else if (provider === 'deepseek') env.DEEPSEEK_API_KEY = apiKey;
+    else if (provider === 'google' || provider === 'gemini') { env.GOOGLE_API_KEY = apiKey; env.GEMINI_API_KEY = apiKey; }
+    else if (provider === 'mistral') env.MISTRAL_API_KEY = apiKey;
+  }
+
+  const args = ['agent', '--local', '--message', toSend, '--model', fullModel, '--json'];
+
+  let child;
+  try { child = spawn('openclaw', args, { cwd: agent.cwd, shell: true, env }); }
+  catch (e) { send(res, { type: 'error', error: 'Failed to start openclaw: ' + String(e) }); agent.busy = false; send(res, { type: 'done' }); return res.end(); }
+
+  agent.child = child;
+  agent.stopped = false;
+
+  let buf = '';
+  child.stdout.on('data', (chunk) => {
+    buf += chunk.toString();
+    let idx;
+    while ((idx = buf.indexOf('\n')) >= 0) {
+      const line = buf.slice(0, idx).trim();
+      buf = buf.slice(idx + 1);
+      if (!line) continue;
+      let evt;
+      try { evt = JSON.parse(line); } catch {
+        send(res, { type: 'text', text: line });
+        continue;
+      }
+      if (evt.type === 'text' || evt.content) {
+        send(res, { type: 'text', text: evt.content || evt.text || '' });
+      } else if (evt.type === 'tool_call' || evt.tool) {
+        send(res, { type: 'tool', name: evt.tool || evt.name || 'tool', input: evt.input || evt.args || {} });
+      } else if (evt.type === 'error') {
+        send(res, { type: 'error', error: evt.message || evt.error || JSON.stringify(evt) });
+      } else {
+        send(res, { type: 'text', text: JSON.stringify(evt) });
+      }
+    }
+  });
+
+  let stderr = '';
+  child.stderr.on('data', (c) => (stderr += c.toString()));
+
+  child.on('close', (code) => {
+    if (buf.trim()) {
+      try {
+        const evt = JSON.parse(buf.trim());
+        if (evt.content || evt.text) send(res, { type: 'text', text: evt.content || evt.text });
+        else send(res, { type: 'text', text: JSON.stringify(evt) });
+      } catch { if (buf.trim()) send(res, { type: 'text', text: buf.trim() }); }
+    }
+    agent.child = null;
+    if (agent.stopped) { send(res, { type: 'system', stopped: true }); agent.stopped = false; }
+    else if (code && code !== 0) send(res, { type: 'error', error: stderr.trim() || `openclaw exited with code ${code}` });
+    agent.totals.turns += 1;
+    if (!agent.totals.history) agent.totals.history = [];
+    agent.totals.history.push({ ts: Date.now(), input: 0, output: 0, cache: 0, cost: 0, engine: 'openclaw' });
+    agent.busy = false;
+    agent.sessionId = agent.sessionId || ('oc-' + agent.id);
+    saveData();
+    send(res, { type: 'done' });
+    res.end();
+  });
+
+  child.on('error', (err) => {
+    send(res, { type: 'error', error: 'Failed to start openclaw: ' + err.message });
+    agent.busy = false;
+    send(res, { type: 'done' });
+    res.end();
+  });
+}
+
 // ---------- Router ----------
 const server = http.createServer(async (req, res) => {
   const { pathname } = new URL(req.url, 'http://localhost');
@@ -353,16 +469,158 @@ const server = http.createServer(async (req, res) => {
 
   if (pathname === '/api/state' && method === 'GET') return json(res, 200, publicState());
 
+  if (pathname === '/api/browse' && method === 'GET') {
+    // List subdirectories of a path. If no path given, list common roots.
+    try {
+      const url = new URL(req.url, 'http://localhost');
+      let target = url.searchParams.get('path') || '';
+      if (!target) {
+        // Root listing on Windows = drive letters; on Unix = home + /.
+        if (process.platform === 'win32') {
+          const drives = [];
+          for (let c = 65; c <= 90; c++) {
+            const letter = String.fromCharCode(c);
+            const p = letter + ':\\';
+            try { if (fs.existsSync(p)) drives.push({ name: letter + ':', path: p }); } catch {}
+          }
+          return json(res, 200, { path: '', parent: null, dirs: drives });
+        } else {
+          target = process.env.HOME || '/';
+        }
+      }
+      // Normalize + safety: prevent access to nothing suspicious (this is local so it's ok)
+      target = path.resolve(target);
+      if (!fs.existsSync(target)) return json(res, 400, { error: 'Path does not exist: ' + target });
+      const stat = fs.statSync(target);
+      if (!stat.isDirectory()) return json(res, 400, { error: 'Not a directory: ' + target });
+      const entries = fs.readdirSync(target, { withFileTypes: true })
+        .filter((e) => e.isDirectory() && !e.name.startsWith('.') && !e.name.startsWith('$'))
+        .sort((a, b) => a.name.localeCompare(b.name))
+        .map((e) => ({ name: e.name, path: path.join(target, e.name) }));
+      const parent = path.dirname(target);
+      return json(res, 200, {
+        path: target,
+        parent: parent !== target ? parent : null,
+        dirs: entries,
+      });
+    } catch (e) { return json(res, 500, { error: e.message }); }
+  }
+
+  if (pathname === '/api/usage' && method === 'GET') {
+    const all = [];
+    for (const a of agents.values()) {
+      const h = (a.totals && a.totals.history) || [];
+      h.forEach((e) => all.push({ ...e, agentId: a.id, agentName: a.name, agentRole: a.role, projectId: a.projectId }));
+    }
+    all.sort((a, b) => a.ts - b.ts);
+    return json(res, 200, { usage: all });
+  }
+
+  if (pathname === '/api/account' && method === 'GET') {
+    try {
+      const child = spawn('claude', ['auth', 'status'], { shell: true, timeout: 8000 });
+      let out = '';
+      child.stdout.on('data', (d) => out += d);
+      child.on('close', (code) => {
+        try {
+          const info = JSON.parse(out.trim());
+          json(res, 200, {
+            logged_in: !!info.loggedIn,
+            email: info.email || null,
+            org: info.orgName || null,
+            plan: info.subscriptionType || null,
+          });
+        } catch {
+          json(res, 200, { logged_in: code === 0, email: null, org: null, plan: null, raw: out.trim() });
+        }
+      });
+    } catch (e) { json(res, 200, { logged_in: false, error: e.message }); }
+    return;
+  }
+
+  const CRED_FILE = path.join(process.env.USERPROFILE || process.env.HOME, '.claude', '.credentials.json');
+  const BACKUP_DIR = String.raw`C:\Users\Lenovo\Documents\Archive June 2026\Zvi Funnel Docs\Projects`;
+
+  if (pathname === '/api/account/logout' && method === 'POST') {
+    try {
+      if (fs.existsSync(CRED_FILE)) {
+        const cred = JSON.parse(fs.readFileSync(CRED_FILE, 'utf8'));
+        const email = cred.claudeAiOauth?.email || 'unknown';
+        const safe = email.replace(/[^a-zA-Z0-9@._-]/g, '_');
+        const ts = new Date().toISOString().slice(0, 10);
+        const backupName = `claude-credentials--${safe}--${ts}.json`;
+        const backupPath = path.join(BACKUP_DIR, backupName);
+        if (!fs.existsSync(BACKUP_DIR)) fs.mkdirSync(BACKUP_DIR, { recursive: true });
+        fs.copyFileSync(CRED_FILE, backupPath);
+        const child = spawn('claude', ['auth', 'logout'], { shell: true, timeout: 8000 });
+        child.on('close', () => json(res, 200, { ok: true, backup: backupName }));
+      } else {
+        json(res, 200, { ok: false, error: 'No credentials file found' });
+      }
+    } catch (e) { json(res, 500, { ok: false, error: e.message }); }
+    return;
+  }
+
+  if (pathname === '/api/account/login' && method === 'POST') {
+    try {
+      const child = spawn('claude', ['auth', 'login'], { shell: true, timeout: 30000 });
+      let out = '';
+      child.stdout.on('data', (d) => out += d);
+      child.on('close', (code) => json(res, 200, { ok: code === 0, output: out.trim() }));
+    } catch (e) { json(res, 500, { ok: false, error: e.message }); }
+    return;
+  }
+
+  if (pathname === '/api/account/backups' && method === 'GET') {
+    try {
+      const files = fs.existsSync(BACKUP_DIR)
+        ? fs.readdirSync(BACKUP_DIR).filter((f) => f.startsWith('claude-credentials--') && f.endsWith('.json'))
+        : [];
+      const backups = files.map((f) => {
+        const m = f.match(/^claude-credentials--(.+?)--(\d{4}-\d{2}-\d{2})\.json$/);
+        return { file: f, email: m ? m[1] : f, date: m ? m[2] : '', path: path.join(BACKUP_DIR, f) };
+      }).sort((a, b) => b.date.localeCompare(a.date));
+      json(res, 200, { backups });
+    } catch (e) { json(res, 200, { backups: [], error: e.message }); }
+    return;
+  }
+
+  if (pathname === '/api/account/restore' && method === 'POST') {
+    try {
+      const b = await readBody(req);
+      const backupPath = path.join(BACKUP_DIR, path.basename(b.file));
+      if (!fs.existsSync(backupPath)) return json(res, 404, { ok: false, error: 'Backup not found' });
+      fs.copyFileSync(backupPath, CRED_FILE);
+      json(res, 200, { ok: true });
+    } catch (e) { json(res, 500, { ok: false, error: e.message }); }
+    return;
+  }
+
   // ----- Projects -----
   if (pathname === '/api/projects' && method === 'POST') {
     const b = await readBody(req);
     const id = randomUUID().slice(0, 8);
-    const proj = { id, name: b.name || 'Untitled Project', cwd: (b.cwd && b.cwd.trim()) || DEFAULT_CWD, contextFiles: [] };
+    const proj = { id, name: b.name || 'Untitled Project', cwd: (b.cwd && b.cwd.trim()) || DEFAULT_CWD, contextFiles: [], size: b.size || '', goal: b.goal || '' };
     state.projects.push(proj);
     state.activeProjectId = id;
-    // Instantiate a template's roles, if requested.
+    // Instantiate a template's roles, if requested. Size + goal biases the leader's soul.
     const tpl = templates.find((t) => t.name === b.templateName);
-    if (tpl) for (const r of tpl.roles) createAgent({ projectId: id, name: r.role, role: r.role, soul: r.soul, model: r.model, reportsTo: r.reportsTo });
+    if (tpl) for (const r of tpl.roles) {
+      let soul = r.soul || '';
+      const isLeader = !r.reportsTo && /director|lead|manager|chief|founder|owner|editor|ceo|cmo|pm/i.test(r.role || '');
+      if (isLeader && (b.size || b.goal)) {
+        const bias = [];
+        if (b.size === 'S') bias.push('This is a SMALL operation (solo / 1-3 people). Bias toward simplicity, single-owner accountability, and lean execution. Avoid recommending headcount you do not have.');
+        if (b.size === 'M') bias.push('This is a MEDIUM operation (4-20 people). Bias toward repeatable processes, delegation, and cross-functional handoffs.');
+        if (b.size === 'L') bias.push('This is a LARGE operation (20+ people). Bias toward specialization, formal review gates, and documented playbooks.');
+        if (b.goal === 'launch') bias.push('The current goal is LAUNCH — ship the MVP fast. Prioritize speed to first revenue over polish. Cut anything not on the critical path.');
+        if (b.goal === 'scale') bias.push('The current goal is SCALE — repeatable growth. Prioritize funnels, tracking, and processes that unlock 10x volume without breaking.');
+        if (b.goal === 'retain') bias.push('The current goal is RETENTION — LTV and lifecycle. Prioritize email flows, post-purchase experience, referrals, and cohort behavior.');
+        if (b.goal === 'hire') bias.push('The current goal is HIRING — find and onboard people. Prioritize sourcing, job descriptions, screening loops, and 30-60-90 plans.');
+        if (bias.length) soul = soul + '\n\n=== PROJECT CONTEXT ===\n' + bias.join('\n');
+      }
+      createAgent({ projectId: id, name: r.role, role: r.role, soul, model: r.model, reportsTo: r.reportsTo });
+    }
     saveData();
     return json(res, 200, publicState());
   }
@@ -402,7 +660,7 @@ const server = http.createServer(async (req, res) => {
     saveData();
     return json(res, 200, publicState());
   }
-  if ((m = pathname.match(/^\/api\/agents\/([^/]+)(\/message|\/model|\/upload|\/edit|\/stop)?$/))) {
+  if ((m = pathname.match(/^\/api\/agents\/([^/]+)(\/message|\/model|\/upload|\/edit|\/stop|\/save)?$/))) {
     const agent = agents.get(m[1]);
     if (method === 'DELETE') { agents.delete(m[1]); saveData(); return json(res, 200, publicState()); }
     if (!agent) return json(res, 404, { error: 'no such agent' });
@@ -429,6 +687,9 @@ const server = http.createServer(async (req, res) => {
       if (b.ccBaseUrl != null) agent.ccBaseUrl = b.ccBaseUrl;
       if (b.ccAuthToken != null) agent.ccAuthToken = b.ccAuthToken;
       if (b.ccModel != null) agent.ccModel = b.ccModel;
+      if (b.ocProvider != null) agent.ocProvider = b.ocProvider;
+      if (b.ocModel != null) agent.ocModel = b.ocModel;
+      if (b.ocApiKey != null) agent.ocApiKey = b.ocApiKey;
       saveData();
       return json(res, 200, publicAgent(agent));
     }
@@ -436,6 +697,20 @@ const server = http.createServer(async (req, res) => {
       const b = await readBody(req);
       try { return json(res, 200, saveUpload(agent.cwd, b.filename, b.dataBase64 || '')); }
       catch (e) { return json(res, 500, { error: String(e) }); }
+    }
+    if (m[2] === '/save' && method === 'POST') {
+      const b = await readBody(req);
+      const md = b.markdown || '';
+      if (!md.trim()) return json(res, 400, { error: 'empty session' });
+      const proj = getProject(agent.projectId);
+      const projName = proj ? proj.name.replace(/[^a-zA-Z0-9 _-]/g, '').trim().replace(/ +/g, '-') : 'project';
+      const role = (agent.role || agent.name || 'agent').replace(/[^a-zA-Z0-9 _-]/g, '').trim().replace(/ +/g, '-');
+      const ts = new Date().toISOString().slice(0, 10);
+      const filename = `mc-session--${projName}--${role}--${ts}.md`;
+      const savePath = path.join(BACKUP_DIR, filename);
+      if (!fs.existsSync(BACKUP_DIR)) fs.mkdirSync(BACKUP_DIR, { recursive: true });
+      fs.writeFileSync(savePath, md, 'utf8');
+      return json(res, 200, { ok: true, path: savePath, filename });
     }
   }
 
@@ -569,5 +844,248 @@ You optimize title, short/long description, keywords, screenshots, and listing e
     ],
   };
 
-  return [marketing, googlePlay];
+  // ============ E-COMMERCE STORE (S) — Launch ============
+  const ecomOwner = `You are the Founder-Operator of a small e-commerce store. You wear every strategic hat — merchant, marketer, ops.
+You think in offers, unit economics, first-order profit, and simple funnels. Read the brief and shared files, form a sharp plan, break work into assignments.
+Always finish with an ASSIGNMENTS section. Format:
+@RoleName: the task
+RoleName must be one of: Copywriter, Product Photographer, Ad Buyer, Customer Service.
+If nothing to assign, write: @none: waiting on input.`;
+  const ecomCopy = `You are a direct-response copywriter for a small e-commerce store. You write punchy headlines, product descriptions, ad copy, and email flows. Give A/B/C variants. Handle top objections. Read the shared files first.`;
+  const ecomPhoto = `You are a product photographer and creative director. You spec product shots, lifestyle photos, unboxing angles, and UGC directions. Deliver shot lists the Founder can send to a photographer or create with a phone.`;
+  const ecomAd = `You are a Meta/Google ad buyer for a small store. You spec creative angles, audience targeting, budget tiers, and daily kill/scale rules. Read shared files. Report on hypothesis → creative → audience → spend for each test.`;
+  const ecomCS = `You are a customer service lead. You draft response templates, refund policy language, FAQ entries, and post-purchase communication that reduces support tickets and lifts LTV.`;
+
+  const ecomSmall = {
+    name: 'E-commerce Store (Small)',
+    description: 'Solo/small-team e-commerce operator: Founder + Copywriter + Product Photographer + Ad Buyer + Customer Service.',
+    roles: [
+      { role: 'Founder-Operator', soul: ecomOwner, model: '', reportsTo: '' },
+      { role: 'Copywriter', soul: ecomCopy, model: '', reportsTo: 'Founder-Operator' },
+      { role: 'Product Photographer', soul: ecomPhoto, model: '', reportsTo: 'Founder-Operator' },
+      { role: 'Ad Buyer', soul: ecomAd, model: '', reportsTo: 'Founder-Operator' },
+      { role: 'Customer Service', soul: ecomCS, model: '', reportsTo: 'Founder-Operator' },
+    ],
+  };
+
+  // ============ E-COMMERCE STORE (M) — Scale ============
+  const cmo = `You are the CMO of a medium e-commerce brand ($1-30M/yr). You own conversion, AOV, retention, and blended ROAS. You think in funnels, cohorts, and category-level bets.
+Read the brief and shared files, form strategy, break work into assignments.
+Always finish with an ASSIGNMENTS section:
+@RoleName: task
+Roles: Copywriter, Email Marketer, Ad Buyer, CRO Analyst, Backend Dev, Data Analyst.
+No fluff. Decision-driven.`;
+  const emailM = `You are a lifecycle email marketer (Klaviyo/Attentive). You design welcome flows, abandoned cart, browse abandonment, post-purchase, VIP, winback, and campaign calendars. Deliver subject lines, previews, and modular blocks. Handle top objections in-flow.`;
+  const cro = `You are a CRO analyst. You audit landing pages, PDPs, cart, and checkout for friction. You spec A/B tests with hypothesis, control, variant, primary metric, and expected lift. Cite behavioral principles when relevant.`;
+  const dataAn = `You are a data analyst for e-commerce. You build daily/weekly dashboards, cohort retention curves, LTV/CAC by channel, and product-mix analysis. Report actionable insights in tight bullets. Cite the numbers.`;
+  const ecomBackend = `You are a backend developer for Shopify/BigCommerce with expertise in headless architectures. You handle API integrations, custom apps, checkout customizations, and data pipelines to warehouses.`;
+
+  const ecomMed = {
+    name: 'E-commerce Store (Medium)',
+    description: 'Scaling e-commerce team: CMO + Copywriter + Email Marketer + Ad Buyer + CRO Analyst + Backend Dev + Data Analyst.',
+    roles: [
+      { role: 'CMO', soul: cmo, model: '', reportsTo: '' },
+      { role: 'Copywriter', soul: ecomCopy, model: '', reportsTo: 'CMO' },
+      { role: 'Email Marketer', soul: emailM, model: '', reportsTo: 'CMO' },
+      { role: 'Ad Buyer', soul: ecomAd, model: '', reportsTo: 'CMO' },
+      { role: 'CRO Analyst', soul: cro, model: '', reportsTo: 'CMO' },
+      { role: 'Backend Developer', soul: ecomBackend, model: '', reportsTo: 'CMO' },
+      { role: 'Data Analyst', soul: dataAn, model: '', reportsTo: 'CMO' },
+    ],
+  };
+
+  // ============ SAAS STARTUP (S) — MVP ============
+  const saasFounder = `You are the Founder/PM of a small SaaS startup. You think in wedge, ICP, TTFV (time to first value), and shipping cadence.
+Read the brief and shared files, form a sharp plan, break work into assignments.
+Always finish with ASSIGNMENTS:
+@RoleName: task
+Roles: Full-Stack Dev, Designer, Growth Marketer.
+Only assign what unlocks the next milestone. If nothing to assign: @none: waiting on input.`;
+  const fullStackDev = `You are a senior full-stack developer (Next.js + Postgres + Node stack). You ship end-to-end features fast — schema, API, UI. You prefer boring tech and small PRs. Read the shared files first; operate on the codebase directly.`;
+  const productDesigner = `You are a product designer for SaaS. You think in flows, first-run experience, and reducing time-to-first-value. Deliver concrete specs the developer can build — screen list, states (empty/loading/error), key interactions, mobile behavior. Reference Linear/Attio/Superhuman patterns.`;
+  const growthM = `You are a growth marketer for early-stage SaaS. You think in acquisition channels, activation loops, and PLG mechanics. Deliver channel tests with hypothesis + minimum viable experiment + kill criteria. Cite the ICP.`;
+
+  const saasSmall = {
+    name: 'SaaS Startup (Small)',
+    description: 'Early SaaS team pre-PMF: Founder/PM + Full-Stack Dev + Designer + Growth Marketer.',
+    roles: [
+      { role: 'Founder/PM', soul: saasFounder, model: '', reportsTo: '' },
+      { role: 'Full-Stack Developer', soul: fullStackDev, model: '', reportsTo: 'Founder/PM' },
+      { role: 'Product Designer', soul: productDesigner, model: '', reportsTo: 'Founder/PM' },
+      { role: 'Growth Marketer', soul: growthM, model: '', reportsTo: 'Founder/PM' },
+    ],
+  };
+
+  // ============ SAAS STARTUP (M) — Growth ============
+  const ceo = `You are the CEO of a growth-stage SaaS ($1-10M ARR). You think in retention, expansion revenue, ICP tightness, and the north-star metric.
+Read the brief and shared files, set the plan, break work into assignments.
+Always finish with ASSIGNMENTS:
+@RoleName: task
+Roles: Head of Growth, Copywriter, Designer, Frontend Dev, Backend Dev, Data Analyst, Support.
+Decisive, no fluff.`;
+  const hog = `You are the Head of Growth for a growth-stage SaaS. You own funnel from anonymous → activation → expansion. You think in cohort retention, PQLs, and channel unit economics. Deliver experiment briefs and channel prioritization matrices.`;
+  const saasFront = `You are a senior frontend developer (React/TypeScript, TailwindCSS). You ship pixel-perfect UI from designer specs, accessible and performant. Read shared files; operate on the codebase.`;
+  const saasBack = `You are a senior backend developer (Node.js + Postgres, or Python + Postgres). You design APIs, schemas, background jobs, and integrations. You care about type safety, migrations, and observability. Read shared files.`;
+  const saasSupport = `You are a customer support engineer for SaaS. You triage tickets, write help-doc articles, spot patterns that hint at product bugs, and escalate cleanly. Deliver macros, article outlines, and weekly digests of top themes.`;
+
+  const saasMed = {
+    name: 'SaaS Startup (Medium)',
+    description: 'Growth-stage SaaS team: CEO + Head of Growth + Copywriter + Designer + Frontend + Backend + Data Analyst + Support.',
+    roles: [
+      { role: 'CEO', soul: ceo, model: '', reportsTo: '' },
+      { role: 'Head of Growth', soul: hog, model: '', reportsTo: 'CEO' },
+      { role: 'Copywriter', soul: ecomCopy, model: '', reportsTo: 'Head of Growth' },
+      { role: 'Product Designer', soul: productDesigner, model: '', reportsTo: 'CEO' },
+      { role: 'Frontend Developer', soul: saasFront, model: '', reportsTo: 'CEO' },
+      { role: 'Backend Developer', soul: saasBack, model: '', reportsTo: 'CEO' },
+      { role: 'Data Analyst', soul: dataAn, model: '', reportsTo: 'CEO' },
+      { role: 'Support', soul: saasSupport, model: '', reportsTo: 'CEO' },
+    ],
+  };
+
+  // ============ CONTENT STUDIO ============
+  const editor = `You are the Editor-in-Chief of a content studio (blog + newsletter + YouTube). You own the editorial calendar, angle selection, and quality bar.
+Read the brief and shared files, set direction, break work into assignments.
+Always finish with ASSIGNMENTS:
+@RoleName: task
+Roles: Researcher, Copywriter, Video Producer, Distribution Lead.
+Only assign what serves this week's publishing calendar. If nothing to assign: @none: waiting on input.`;
+  const contentResearcher = `You are a senior content researcher. You dig into topics, competitor coverage, primary sources, expert quotes, and data. Deliver research memos: TL;DR + 5-10 sharp bullets + list of sources with quotes. No fluff.`;
+  const videoProducer = `You are a video producer for YouTube. You spec scripts (hook / setup / turn / payoff / CTA), B-roll ideas, on-screen graphics, and thumbnail concepts (3 A/B options). You think in retention curves and pattern interrupts.`;
+  const distro = `You are a content distribution lead. Every published piece gets a distribution plan: Twitter thread, LinkedIn post, newsletter blurb, Reddit-appropriate variant, and community-specific angles. Deliver ready-to-post copy per platform.`;
+
+  const contentStudio = {
+    name: 'Content Studio',
+    description: 'Blog + newsletter + YouTube content team: Editor + Researcher + Copywriter + Video Producer + Distribution Lead.',
+    roles: [
+      { role: 'Editor-in-Chief', soul: editor, model: '', reportsTo: '' },
+      { role: 'Researcher', soul: contentResearcher, model: '', reportsTo: 'Editor-in-Chief' },
+      { role: 'Copywriter', soul: ecomCopy, model: '', reportsTo: 'Editor-in-Chief' },
+      { role: 'Video Producer', soul: videoProducer, model: '', reportsTo: 'Editor-in-Chief' },
+      { role: 'Distribution Lead', soul: distro, model: '', reportsTo: 'Editor-in-Chief' },
+    ],
+  };
+
+  // ============ SOLO FOUNDER (Bootstrap) ============
+  const chiefOfStaff = `You are the Chief of Staff for a solo founder. Your job is to be the founder's second brain — you triage, prioritize, and orchestrate two specialist workers.
+Read the brief. Decide if this needs a marketer, a developer, or both. Then break the work into 1-2 assignments.
+Always finish with ASSIGNMENTS:
+@RoleName: task
+Roles: Marketer, Developer.
+If nothing to assign right now (founder needs to think first): @none: waiting on input.
+Bias toward tiny, shippable next actions. This is a bootstrapped operation — every hour matters.`;
+  const soloMarketer = `You are the marketing generalist for a solo founder. You do everything: copy, content, ads, email, community, SEO. You bias toward channels with fast feedback loops. Always propose the smallest viable experiment first.`;
+  const soloDev = `You are the technical generalist for a solo founder. You build MVPs fast, glue APIs, ship landing pages, wire analytics, and automate manual work. Boring tech first; only fancy when it earns its keep.`;
+
+  const soloFounder = {
+    name: 'Solo Founder (Bootstrap)',
+    description: 'Chief of Staff (director) + Marketer + Developer. Minimum viable team for a side-hustle or bootstrapped operation.',
+    roles: [
+      { role: 'Chief of Staff', soul: chiefOfStaff, model: '', reportsTo: '' },
+      { role: 'Marketer', soul: soloMarketer, model: '', reportsTo: 'Chief of Staff' },
+      { role: 'Developer', soul: soloDev, model: '', reportsTo: 'Chief of Staff' },
+    ],
+  };
+
+  // ============ AGENCY (DTC Retention) ============
+  const accountMgr = `You are the Account Manager at a DTC retention agency. Your job is client outcomes — you own the roadmap, weekly check-ins, and the "why" behind every deliverable.
+Read the brief and shared files, decide the plan, break work into assignments for the specialists.
+Always finish with ASSIGNMENTS:
+@RoleName: task
+Roles: Advertorial Writer, Email Marketer, Designer, Frontend Developer, Analyst.
+Everything ties back to a metric — CVR, AOV, LTV, or repeat rate. If nothing to assign: @none: waiting on input.`;
+  const advertorial = `You are an advertorial copywriter for DTC brands. You write long-form advertorials in the customer's voice with heavy proof stacking (testimonials, before/afters, expert cites, data). Story-first, product-later. Deliver full drafts with clear angle + hook + turn + CTA sections.`;
+  const agencyEmail = emailM;
+  const agencyDesigner = `You are a designer specializing in DTC — landing pages, PDPs, email templates, and creative briefs for photo/video shoots. You think mobile-first, above-the-fold, and reduce-cognitive-load. Deliver concrete specs and Figma-ready component descriptions.`;
+  const agencyFront = `You are a frontend developer for DTC stores (Shopify Liquid, custom sections, headless Next.js). You implement designer specs and copywriter's copy faithfully. Fast page loads. Mobile-first.`;
+  const agencyAnalyst = dataAn;
+
+  const agency = {
+    name: 'Agency — DTC Retention',
+    description: 'DTC retention studio: Account Manager + Advertorial Writer + Email Marketer + Designer + Frontend Dev + Analyst.',
+    roles: [
+      { role: 'Account Manager', soul: accountMgr, model: '', reportsTo: '' },
+      { role: 'Advertorial Writer', soul: advertorial, model: '', reportsTo: 'Account Manager' },
+      { role: 'Email Marketer', soul: agencyEmail, model: '', reportsTo: 'Account Manager' },
+      { role: 'Designer', soul: agencyDesigner, model: '', reportsTo: 'Account Manager' },
+      { role: 'Frontend Developer', soul: agencyFront, model: '', reportsTo: 'Designer' },
+      { role: 'Analyst', soul: agencyAnalyst, model: '', reportsTo: 'Account Manager' },
+    ],
+  };
+
+  // ============ COACHING BUSINESS ============
+  const coach = `You are the Coach/Founder of a coaching business. Your product is your expertise + a delivery mechanism (courses, cohorts, 1:1s, group programs).
+Read the brief and shared files, set the plan, break work into assignments.
+Always finish with ASSIGNMENTS:
+@RoleName: task
+Roles: Content Creator, Video Editor, Community Manager.
+Focus on the client transformation. If nothing to assign: @none: waiting on input.`;
+  const contentCreator = `You are a content creator for a coach's personal brand. You write threads, hooks, case-study posts, and short-form video scripts. You extract the coach's frameworks into 60-second hooks. You publish daily rhythms across LinkedIn + Twitter + IG.`;
+  const videoEditor = `You are a short-form video editor. You cut 60-90s clips from long-form coach content (podcast, YouTube, webinar). Hook in first 3s, captions, jump cuts, B-roll. Deliver 3-5 cut variants per source video.`;
+  const communityMgr = `You are the community manager for a coach's paid community (Discord/Circle/Skool). You handle onboarding, prompt daily discussion, surface success stories, and flag members at churn risk. Deliver weekly community health reports and topic calendars.`;
+
+  const coaching = {
+    name: 'Coaching Business',
+    description: 'Personal brand + coaching program: Coach + Content Creator + Video Editor + Community Manager.',
+    roles: [
+      { role: 'Coach/Founder', soul: coach, model: '', reportsTo: '' },
+      { role: 'Content Creator', soul: contentCreator, model: '', reportsTo: 'Coach/Founder' },
+      { role: 'Video Editor', soul: videoEditor, model: '', reportsTo: 'Content Creator' },
+      { role: 'Community Manager', soul: communityMgr, model: '', reportsTo: 'Coach/Founder' },
+    ],
+  };
+
+  // ============ LOCAL SERVICE (Restaurant / Salon / etc.) ============
+  const localOwner = `You are the Owner of a local service business (restaurant, salon, gym, clinic, etc.). You think in foot traffic, repeat visits, local reputation, and staff scheduling.
+Read the brief and shared files, set the plan, break work into assignments.
+Always finish with ASSIGNMENTS:
+@RoleName: task
+Roles: Local Marketer, Social Media Manager, Reviews Manager.
+Focus on this week's revenue. If nothing to assign: @none: waiting on input.`;
+  const localMarketer = `You are a local marketing specialist. You handle Google Business Profile optimization, local SEO, community sponsorships, referral programs, and neighborhood promotions. Deliver concrete this-week actions and quarterly plans.`;
+  const socialMgr = `You are a social media manager for local businesses. You post daily on Instagram + TikTok + Facebook with location-tagged content — behind-the-scenes, staff spotlights, customer moments, weekly specials. Deliver a week's worth of drafts at a time.`;
+  const reviewsMgr = `You are a reviews and reputation manager. You draft response templates to Google/Yelp reviews (positive + negative + neutral), design a review-solicitation flow, and monitor for reputation risks. Every response is warm, specific, and on-brand.`;
+
+  const localService = {
+    name: 'Local Service Business',
+    description: 'Owner-operated local business: Owner + Local Marketer + Social Media Manager + Reviews Manager.',
+    roles: [
+      { role: 'Owner', soul: localOwner, model: '', reportsTo: '' },
+      { role: 'Local Marketer', soul: localMarketer, model: '', reportsTo: 'Owner' },
+      { role: 'Social Media Manager', soul: socialMgr, model: '', reportsTo: 'Owner' },
+      { role: 'Reviews Manager', soul: reviewsMgr, model: '', reportsTo: 'Owner' },
+    ],
+  };
+
+  // ============ REAL ESTATE INVESTOR ============
+  const investor = `You are a Real Estate Investor / Portfolio Manager. You focus on deal flow, underwriting, and portfolio-level returns (single-family / multi-family / short-term rentals depending on the brief).
+Read the brief and shared files, set the plan, break work into assignments.
+Always finish with ASSIGNMENTS:
+@RoleName: task
+Roles: Deal Analyst, Copywriter, Property Researcher, Content Creator.
+Every action ties to a deal or portfolio metric. If nothing to assign: @none: waiting on input.`;
+  const dealAnalyst = `You are a real estate deal analyst. You underwrite deals — comps, cap rates, cash-on-cash, IRR, DSCR, exit assumptions. Deliver clean underwriting memos with sensitivity analysis and a go/no-go recommendation. Show the numbers.`;
+  const propResearcher = `You are a property researcher. You dig into markets (permits, migration, employment), neighborhoods (crime, schools, walkability), and specific properties (title, liens, deferred maintenance signals). Deliver market briefs and property dossiers.`;
+  const investorCopy = `You are a copywriter for a real estate investor's brand. You write investor updates, deal memos to LPs, listing descriptions (for exits), and thought-leadership posts on LinkedIn/X. Cite specific numbers.`;
+  const investorContent = `You are a content creator for a real estate investor's personal brand. You extract case studies from actual deals into shareable posts. Deals → lessons → posts. Weekly rhythm.`;
+
+  const realEstate = {
+    name: 'Real Estate Investor',
+    description: 'RE portfolio operator: Investor + Deal Analyst + Copywriter + Property Researcher + Content Creator.',
+    roles: [
+      { role: 'Investor/PM', soul: investor, model: '', reportsTo: '' },
+      { role: 'Deal Analyst', soul: dealAnalyst, model: '', reportsTo: 'Investor/PM' },
+      { role: 'Property Researcher', soul: propResearcher, model: '', reportsTo: 'Investor/PM' },
+      { role: 'Copywriter', soul: investorCopy, model: '', reportsTo: 'Investor/PM' },
+      { role: 'Content Creator', soul: investorContent, model: '', reportsTo: 'Investor/PM' },
+    ],
+  };
+
+  return [
+    marketing, googlePlay,
+    ecomSmall, ecomMed,
+    saasSmall, saasMed,
+    contentStudio, soloFounder, agency, coaching,
+    localService, realEstate,
+  ];
 }
