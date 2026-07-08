@@ -5,6 +5,13 @@ data.json
 data.json.bak
 templates.json
 
+# The Reel data store — holds Anthropic + Higgsfield API keys in plain text
+reel-data.json
+reel-data.json.bak
+
+# Local tooling config (preview launch config, permissions, etc.)
+.claude/
+
 # Uploads land inside project folders
 mc-uploads/
 

@@ -88,15 +88,15 @@
   .proj-label { font-size:10px; color:var(--muted); text-transform:uppercase; letter-spacing:0.12em; }
   #projSelect {
     background:transparent; border:0; color:var(--text);
-    font:600 14px 'Space Grotesk',sans-serif; padding:0;
+    font:600 14px var(--font-body); padding:0;
     cursor:pointer; outline:none;
   }
   #projSelect option { background:var(--panel); color:var(--text); }
 
   /* Cost hero — the signature odometer */
   .cost-hero-wrap { display:flex; flex-direction:column; gap:2px; padding-right:14px; border-right:1px solid var(--line); }
-  .cost-hero-label { font-size:9.5px; color:var(--muted); text-transform:uppercase; letter-spacing:0.18em; font-weight:600; }
-  .cost-hero-row { display:flex; align-items:baseline; gap:8px; }
+  .cost-hero-label { font-size:10px; color:var(--muted); text-transform:uppercase; letter-spacing:0.12em; font-weight:600; }
+  .cost-hero-row { display:flex; align-items:center; gap:8px; }
   .cost-hero {
     font-family:var(--font-display);   /* Fraunces — money in serif */
     font-size:30px; font-weight:600;
@@ -952,6 +952,7 @@
       <button id="viewChat" class="on">Agents</button>
       <button id="viewLog">Log</button>
       <button id="viewDiagram">Diagram</button>
+      <button id="viewReel" title="The Reel — content atelier">The Reel</button>
     </div>
 
     <div class="toggle" id="layoutBar">
@@ -999,6 +1000,7 @@
       <div id="gridView" class="grid-mode hidden"></div>
       <div id="missionLog" class="hidden"></div>
       <div id="diagram" class="hidden"></div>
+      <div id="reelView" class="hidden"></div>
 
     </section>
 
@@ -1074,6 +1076,8 @@
       <option value="claude-code">Claude Code — full tools (files + shell)</option>
       <option value="api">Direct API — chat only (OpenAI-compatible)</option>
       <option value="openclaw">OpenClaw — full autonomy + browser, any model</option>
+      <option value="codex">Codex — OpenAI Codex CLI, full tools</option>
+      <option value="hermes">Hermes — Nous Research autonomous agent, any model</option>
     </select></div>
 
     <div id="wmCcFields">
@@ -1085,6 +1089,14 @@
         <option value="high">High</option>
         <option value="max">Max</option>
       </select></div>
+      <div class="field">
+        <label>Claude account token <span style="color:var(--muted);font-weight:normal">— optional, runs this worker on a different Claude account</span></label>
+        <div style="display:flex;gap:8px;align-items:center">
+          <input id="wmCcOauth" placeholder="leave blank to use this machine's login" style="flex:1" />
+          <button type="button" id="wmCcOauthGet" class="btn" style="white-space:nowrap">Get token</button>
+        </div>
+        <div style="color:var(--muted);font-size:11px;margin-top:4px">Paste a token from <code>claude setup-token</code>. Isolated per worker — does not affect your main login.</div>
+      </div>
       <details>
         <summary style="cursor:pointer;color:var(--muted);font-size:12px;margin-bottom:8px">Advanced: proxy to non-Anthropic model</summary>
         <div class="field"><label>Proxy Base URL</label><input id="wmCcBase" placeholder="leave blank for normal Anthropic" /></div>
@@ -1103,6 +1115,17 @@
       <div class="field"><label>API Base URL</label><input id="wmApiBase" placeholder="https://api.openai.com/v1" /></div>
       <div class="field"><label>API Key</label><input id="wmApiKey" placeholder="sk-..." /></div>
       <div class="field"><label>Model</label><input id="wmApiModel" placeholder="e.g. gpt-4o" /></div>
+    </div>
+
+    <div id="wmCodexFields" class="hidden">
+      <div class="field"><label>Model</label><input id="wmCodexModel" placeholder="leave blank for Codex default (e.g. gpt-5-codex)" /></div>
+      <div class="field"><label>OpenAI API Key</label><input id="wmCodexApiKey" placeholder="sk-... (blank = use codex login)" /></div>
+    </div>
+
+    <div id="wmHermesFields" class="hidden">
+      <div class="field"><label>Provider</label><input id="wmHermesProvider" placeholder="openrouter / anthropic / openai / gemini (optional)" /></div>
+      <div class="field"><label>Model</label><input id="wmHermesModel" placeholder="e.g. anthropic/claude-sonnet-5, nousresearch/hermes-4" /></div>
+      <div class="field"><label>API Key</label><input id="wmHermesApiKey" placeholder="key for the provider (blank = use hermes config)" /></div>
     </div>
 
     <div class="field"><label>Soul (.md persona)</label><textarea id="wmSoul" placeholder="You are a senior..."></textarea></div>
@@ -1165,6 +1188,7 @@
     <div class="modal-actions" style="margin-top:14px"><button class="ghost" data-close>Close</button></div>
   </div></div>
 
+  <script src="/reel-ui.js"></script>
   <script src="/app.js"></script>
 </body>
 </html>

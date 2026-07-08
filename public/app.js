@@ -46,7 +46,7 @@ const cards = new Map();
 let editingAgentId = null;
 let editingTemplate = null;
 let focusedAgentId = null;
-let currentView = 'chat';       // chat | log | diagram
+let currentView = 'chat';       // chat | log | diagram | reel
 let currentLayout = 'focus';    // focus | grid
 const missionLogEntries = [];
 const activityFeed = [];
@@ -167,14 +167,17 @@ function renderCenter() {
   const grid = $('gridView');
   const log = $('missionLog');
   const diag = $('diagram');
+  const reel = $('reelView');
 
   ws.classList.add('hidden');
   grid.classList.add('hidden');
   log.classList.add('hidden');
   diag.classList.add('hidden');
+  reel.classList.add('hidden');
 
   if (currentView === 'log') { renderMissionLog(); log.classList.remove('hidden'); return; }
   if (currentView === 'diagram') { renderDiagram(); diag.classList.remove('hidden'); return; }
+  if (currentView === 'reel') { window.ReelUI && window.ReelUI.render(reel); reel.classList.remove('hidden'); return; }
 
   // chat view
   if (currentLayout === 'grid') {
@@ -236,6 +239,10 @@ function renderFocus() {
     meta_.append(makeMetaTag('OC ' + (meta.ocProvider ? meta.ocProvider + '/' : '') + (meta.ocModel || '?'), 'oc'));
   } else if (meta.engine === 'api') {
     meta_.append(makeMetaTag('API ' + (meta.apiModel || '?'), 'api'));
+  } else if (meta.engine === 'codex') {
+    meta_.append(makeMetaTag('CODEX ' + (meta.codexModel || 'default'), 'oc'));
+  } else if (meta.engine === 'hermes') {
+    meta_.append(makeMetaTag('HERMES ' + (meta.hermesProvider ? meta.hermesProvider + '/' : '') + (meta.hermesModel || '?'), 'oc'));
   } else {
     // model + effort selectors inline
     const modelSel = el('select', null); modelSel.style.cssText = 'background:var(--input);color:var(--text);border:1px solid var(--line);border-radius:4px;padding:3px 6px;font-size:11px;';
@@ -398,11 +405,13 @@ function makeCard(meta) {
   const modelSel = el('select');
   MODELS.forEach((m) => { const o = el('option', null, m.label); o.value = m.v; if (m.v === (meta.model || '')) o.selected = true; modelSel.appendChild(o); });
   modelSel.onchange = async () => { await api('/api/agents/' + meta.id + '/model', 'POST', { model: modelSel.value }); };
-  if (meta.engine === 'api' || meta.engine === 'openclaw') modelSel.style.display = 'none';
+  if (meta.engine === 'api' || meta.engine === 'openclaw' || meta.engine === 'codex' || meta.engine === 'hermes') modelSel.style.display = 'none';
   ctrl.append(modelSel);
 
   if (meta.engine === 'openclaw') ctrl.append(makeMetaTag('OC ' + (meta.ocProvider ? meta.ocProvider + '/' : '') + (meta.ocModel || '?'), 'oc'));
   else if (meta.engine === 'api') ctrl.append(makeMetaTag('API ' + (meta.apiModel || '?'), 'api'));
+  else if (meta.engine === 'codex') ctrl.append(makeMetaTag('CODEX ' + (meta.codexModel || 'default'), 'oc'));
+  else if (meta.engine === 'hermes') ctrl.append(makeMetaTag('HERMES ' + (meta.hermesProvider ? meta.hermesProvider + '/' : '') + (meta.hermesModel || '?'), 'oc'));
 
   ctrl.append(mkIcon('💾', 'Save', () => saveSession(meta.id)));
   ctrl.append(mkIcon('✎', 'Edit', () => openWorker(meta.id)));
@@ -692,6 +701,8 @@ function syncEngineFields() {
   $('wmApiFields').classList.toggle('hidden', eng !== 'api');
   $('wmCcFields').classList.toggle('hidden', eng !== 'claude-code');
   $('wmOcFields').classList.toggle('hidden', eng !== 'openclaw');
+  $('wmCodexFields').classList.toggle('hidden', eng !== 'codex');
+  $('wmHermesFields').classList.toggle('hidden', eng !== 'hermes');
 }
 function openWorker(id, presetReports) {
   editingAgentId = id || null;
@@ -708,10 +719,28 @@ function openWorker(id, presetReports) {
   $('wmCcBase').value = a ? (a.ccBaseUrl || '') : '';
   $('wmCcToken').value = a ? (a.ccAuthToken || '') : '';
   $('wmCcModel').value = a ? (a.ccModel || '') : '';
+  $('wmCcOauth').value = a ? (a.ccOauthToken || '') : '';
   $('wmOcProvider').value = a ? (a.ocProvider || '') : '';
   $('wmOcModel').value = a ? (a.ocModel || '') : '';
   $('wmOcApiKey').value = a ? (a.ocApiKey || '') : '';
+  $('wmCodexModel').value = a ? (a.codexModel || '') : '';
+  $('wmCodexApiKey').value = a ? (a.codexApiKey || '') : '';
+  $('wmHermesProvider').value = a ? (a.hermesProvider || '') : '';
+  $('wmHermesModel').value = a ? (a.hermesModel || '') : '';
+  $('wmHermesApiKey').value = a ? (a.hermesApiKey || '') : '';
   $('wmSoul').value = a ? a.soul : '';
+  $('wmCcOauthGet').onclick = async () => {
+    const btn = $('wmCcOauthGet');
+    btn.disabled = true; btn.textContent = 'Opening…';
+    try {
+      const r = await api('/api/account/setup-token', 'POST');
+      alert(r && r.ok
+        ? 'A terminal window opened running `claude setup-token`.\n\nApprove the account you want in the browser, then copy the printed token and paste it into the field.'
+        : 'Could not open the terminal: ' + ((r && r.error) || 'unknown error') + '\n\nRun `claude setup-token` manually and paste the token here.');
+    } catch (e) {
+      alert('Could not open the terminal. Run `claude setup-token` manually and paste the token here.');
+    } finally { btn.disabled = false; btn.textContent = 'Get token'; }
+  };
   syncEngineFields();
   openModal('workerModal');
 }
@@ -722,8 +751,10 @@ async function saveWorker() {
     reportsTo: $('wmReports').value, model: $('wmModel').value,
     effort: $('wmEffort').value, soul: $('wmSoul').value, engine: $('wmEngine').value,
     apiBaseUrl: $('wmApiBase').value.trim(), apiKey: $('wmApiKey').value.trim(), apiModel: $('wmApiModel').value.trim(),
-    ccBaseUrl: $('wmCcBase').value.trim(), ccAuthToken: $('wmCcToken').value.trim(), ccModel: $('wmCcModel').value.trim(),
+    ccBaseUrl: $('wmCcBase').value.trim(), ccAuthToken: $('wmCcToken').value.trim(), ccModel: $('wmCcModel').value.trim(), ccOauthToken: $('wmCcOauth').value.trim(),
     ocProvider: $('wmOcProvider').value.trim(), ocModel: $('wmOcModel').value.trim(), ocApiKey: $('wmOcApiKey').value.trim(),
+    codexModel: $('wmCodexModel').value.trim(), codexApiKey: $('wmCodexApiKey').value.trim(),
+    hermesProvider: $('wmHermesProvider').value.trim(), hermesModel: $('wmHermesModel').value.trim(), hermesApiKey: $('wmHermesApiKey').value.trim(),
   };
   if (editingAgentId) await api('/api/agents/' + editingAgentId + '/edit', 'POST', body);
   else await api('/api/agents', 'POST', { ...body, projectId: proj.id });
@@ -840,6 +871,7 @@ function applyViewButtons() {
   $('viewChat').classList.toggle('on', currentView === 'chat');
   $('viewLog').classList.toggle('on', currentView === 'log');
   $('viewDiagram').classList.toggle('on', currentView === 'diagram');
+  $('viewReel').classList.toggle('on', currentView === 'reel');
 }
 function applyLayoutButtons() {
   document.querySelectorAll('#layoutBar button').forEach((b) => b.classList.toggle('on', b.dataset.layout === currentLayout));
@@ -871,7 +903,7 @@ function renderDiagram() {
     const box = el('div', 'node' + (isDirector(a) ? ' director' : ''));
     const title = el('div', 'nr', role); title.title = 'Click to focus'; title.onclick = () => focusAgent(a.id);
     box.append(title);
-    const eng = a.engine === 'api' ? 'API:' + (a.apiModel || '?') : a.engine === 'openclaw' ? 'OC:' + (a.ocProvider ? a.ocProvider + '/' : '') + (a.ocModel || '?') : (a.ccModel ? '⇄' + a.ccModel : (MODELS.find((m) => m.v === a.model) || {}).label || 'Default');
+    const eng = a.engine === 'api' ? 'API:' + (a.apiModel || '?') : a.engine === 'openclaw' ? 'OC:' + (a.ocProvider ? a.ocProvider + '/' : '') + (a.ocModel || '?') : a.engine === 'codex' ? 'CODEX:' + (a.codexModel || 'default') : a.engine === 'hermes' ? 'HERMES:' + (a.hermesProvider ? a.hermesProvider + '/' : '') + (a.hermesModel || '?') : (a.ccModel ? '⇄' + a.ccModel : (MODELS.find((m) => m.v === a.model) || {}).label || 'Default');
     box.append(el('div', 'nn', '#' + a.num + ' · ' + eng));
     const t = a.totals || {};
     box.append(el('div', 'nt', '$' + (t.cost || 0).toFixed(3) + ' · ' + fmt((t.input || 0) + (t.output || 0)) + ' tok'));
@@ -1317,6 +1349,7 @@ $('cmdkTrigger').onclick = () => openCmdk('');
 $('viewChat').onclick = () => setView('chat');
 $('viewLog').onclick = () => setView('log');
 $('viewDiagram').onclick = () => setView('diagram');
+$('viewReel').onclick = () => setView('reel');
 $('addWorkerBtn').onclick = () => openWorker(null);
 $('saveTplBtn').onclick = saveProjectAsTemplate;
 $('addFileBtn').onclick = () => $('fileInput').click();

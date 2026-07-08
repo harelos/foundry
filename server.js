@@ -15,6 +15,9 @@ const PERMISSION_MODE = process.env.MC_PERMISSION_MODE || 'bypassPermissions';
 const DATA_FILE = path.join(__dirname, 'data.json');
 const TEMPLATES_FILE = path.join(__dirname, 'templates.json');
 
+// The Reel — mini-app router
+const reel = require('./reel');
+
 // ---------- State ----------
 let state = { projects: [], activeProjectId: null, nextNum: 1 };
 let templates = [];
@@ -67,8 +70,11 @@ function saveData() {
       model: a.model, effort: a.effort, reportsTo: a.reportsTo, projectId: a.projectId,
       cwd: a.cwd, sessionId: a.sessionId, totals: a.totals, primedSoul: a.primedSoul,
       engine: a.engine, apiBaseUrl: a.apiBaseUrl, apiKey: a.apiKey, apiModel: a.apiModel,
-      ccBaseUrl: a.ccBaseUrl, ccAuthToken: a.ccAuthToken, ccModel: a.ccModel,
-      ocModel: a.ocModel, ocApiKey: a.ocApiKey, ocProvider: a.ocProvider, apiHistory: a.apiHistory || [],
+      ccBaseUrl: a.ccBaseUrl, ccAuthToken: a.ccAuthToken, ccModel: a.ccModel, ccOauthToken: a.ccOauthToken,
+      ocModel: a.ocModel, ocApiKey: a.ocApiKey, ocProvider: a.ocProvider,
+      codexModel: a.codexModel, codexApiKey: a.codexApiKey,
+      hermesProvider: a.hermesProvider, hermesModel: a.hermesModel, hermesApiKey: a.hermesApiKey,
+      apiHistory: a.apiHistory || [],
       totalsHistory: (a.totals && a.totals.history) || [],
     })),
   };
@@ -92,8 +98,10 @@ function publicAgent(a) {
            cwd: a.cwd, busy: a.busy, hasSession: !!a.sessionId, totals: a.totals,
            engine: a.engine || 'claude-code',
            apiBaseUrl: a.apiBaseUrl || '', apiKey: a.apiKey || '', apiModel: a.apiModel || '',
-           ccBaseUrl: a.ccBaseUrl || '', ccAuthToken: a.ccAuthToken || '', ccModel: a.ccModel || '',
-           ocModel: a.ocModel || '', ocApiKey: a.ocApiKey || '', ocProvider: a.ocProvider || '' };
+           ccBaseUrl: a.ccBaseUrl || '', ccAuthToken: a.ccAuthToken || '', ccModel: a.ccModel || '', ccOauthToken: a.ccOauthToken || '',
+           ocModel: a.ocModel || '', ocApiKey: a.ocApiKey || '', ocProvider: a.ocProvider || '',
+           codexModel: a.codexModel || '', codexApiKey: a.codexApiKey || '',
+           hermesProvider: a.hermesProvider || '', hermesModel: a.hermesModel || '', hermesApiKey: a.hermesApiKey || '' };
 }
 function publicState() {
   return {
@@ -178,8 +186,10 @@ function createAgent(o) {
     // Engine: 'claude-code' (full tools) or 'api' (direct OpenAI-compatible, chat only)
     engine: o.engine || 'claude-code', effort: o.effort || '',
     apiBaseUrl: o.apiBaseUrl || '', apiKey: o.apiKey || '', apiModel: o.apiModel || '',
-    ccBaseUrl: o.ccBaseUrl || '', ccAuthToken: o.ccAuthToken || '', ccModel: o.ccModel || '',
+    ccBaseUrl: o.ccBaseUrl || '', ccAuthToken: o.ccAuthToken || '', ccModel: o.ccModel || '', ccOauthToken: o.ccOauthToken || '',
     ocModel: o.ocModel || '', ocApiKey: o.ocApiKey || '', ocProvider: o.ocProvider || '',
+    codexModel: o.codexModel || '', codexApiKey: o.codexApiKey || '',
+    hermesProvider: o.hermesProvider || '', hermesModel: o.hermesModel || '', hermesApiKey: o.hermesApiKey || '',
     sessionId: null, busy: false, totals: newTotals(), primedSoul: false, pendingContext: null,
     apiHistory: [],
   };
@@ -207,6 +217,8 @@ function stopAgent(agent) {
 function runTurn(agent, text, res) {
   if (agent.engine === 'api') return runApiTurn(agent, text, res);
   if (agent.engine === 'openclaw') return runOpenClawTurn(agent, text, res);
+  if (agent.engine === 'codex') return runCodexTurn(agent, text, res);
+  if (agent.engine === 'hermes') return runHermesTurn(agent, text, res);
 
   agent.busy = true;
   res.writeHead(200, { 'Content-Type': 'application/x-ndjson; charset=utf-8', 'Cache-Control': 'no-cache' });
@@ -232,6 +244,15 @@ function runTurn(agent, text, res) {
   const env = { ...process.env };
   if (agent.ccBaseUrl) env.ANTHROPIC_BASE_URL = agent.ccBaseUrl;
   if (agent.ccAuthToken) { env.ANTHROPIC_AUTH_TOKEN = agent.ccAuthToken; env.ANTHROPIC_API_KEY = agent.ccAuthToken; }
+  // Per-agent Claude account: a long-lived OAuth token from `claude setup-token`.
+  // Runs this agent on a DIFFERENT Claude subscription than the machine login,
+  // fully isolated, without touching ~/.claude/.credentials.json. Ignored if the
+  // proxy above is in use. We clear any inherited key so the token wins.
+  else if (agent.ccOauthToken) {
+    env.CLAUDE_CODE_OAUTH_TOKEN = agent.ccOauthToken;
+    delete env.ANTHROPIC_API_KEY;
+    delete env.ANTHROPIC_AUTH_TOKEN;
+  }
 
   let child;
   try { child = spawn('claude', args, { cwd: agent.cwd, shell: true, env }); }
@@ -459,6 +480,205 @@ async function runOpenClawTurn(agent, text, res) {
   });
 }
 
+// ---------- Codex turn (OpenAI Codex CLI, full tools) ----------
+// Assumes the `codex` CLI is installed (npm i -g @openai/codex) and runs headless via
+// `codex exec`. Auth via OPENAI_API_KEY (or the CLI's own ChatGPT login if no key set).
+// JSONL event schema varies across Codex versions, so parsing is intentionally lenient.
+async function runCodexTurn(agent, text, res) {
+  agent.busy = true;
+  res.writeHead(200, { 'Content-Type': 'application/x-ndjson; charset=utf-8', 'Cache-Control': 'no-cache' });
+
+  let toSend = text;
+  if (!agent.primedSoul) {
+    const persona = buildPersona(agent, { withContents: true });
+    if (persona) toSend = persona + '\n\n=== YOUR TASK ===\n' + text;
+    agent.primedSoul = true;
+  }
+
+  const env = { ...process.env };
+  const apiKey = (agent.codexApiKey || '').trim();
+  if (apiKey) env.OPENAI_API_KEY = apiKey;
+
+  const model = (agent.codexModel || '').trim();
+  const args = ['exec', '--json', '--skip-git-repo-check'];
+  if (model) args.push('-m', model);
+  args.push(toSend);
+
+  let child;
+  try { child = spawn('codex', args, { cwd: agent.cwd, shell: true, env }); }
+  catch (e) { send(res, { type: 'error', error: 'Failed to start codex: ' + String(e) }); agent.busy = false; send(res, { type: 'done' }); return res.end(); }
+
+  agent.child = child;
+  agent.stopped = false;
+
+  // Pull any human-readable text out of a Codex JSONL event, whatever its shape.
+  const extractText = (evt) => {
+    if (!evt || typeof evt !== 'object') return '';
+    if (typeof evt.text === 'string') return evt.text;
+    if (typeof evt.content === 'string') return evt.content;
+    if (typeof evt.message === 'string') return evt.message;
+    if (typeof evt.delta === 'string') return evt.delta;
+    const it = evt.item || evt.msg || {};
+    if (typeof it.text === 'string') return it.text;
+    if (typeof it.message === 'string') return it.message;
+    return '';
+  };
+
+  let buf = '';
+  child.stdout.on('data', (chunk) => {
+    buf += chunk.toString();
+    let idx;
+    while ((idx = buf.indexOf('\n')) >= 0) {
+      const line = buf.slice(0, idx).trim();
+      buf = buf.slice(idx + 1);
+      if (!line) continue;
+      let evt;
+      try { evt = JSON.parse(line); } catch { send(res, { type: 'text', text: line }); continue; }
+      const t = extractText(evt);
+      const kind = evt.type || (evt.item && evt.item.type) || (evt.msg && evt.msg.type) || '';
+      if (/command|exec|tool|patch|file/i.test(String(kind)) && !t) {
+        send(res, { type: 'tool', name: String(kind), input: evt.item || evt.msg || {} });
+      } else if (t) {
+        send(res, { type: 'text', text: t });
+      }
+      // silently ignore pure-metadata events (reasoning traces, token counts, etc.)
+    }
+  });
+
+  let stderr = '';
+  child.stderr.on('data', (c) => (stderr += c.toString()));
+
+  child.on('close', (code) => {
+    if (buf.trim()) {
+      try { const evt = JSON.parse(buf.trim()); const t = extractText(evt); if (t) send(res, { type: 'text', text: t }); }
+      catch { send(res, { type: 'text', text: buf.trim() }); }
+    }
+    agent.child = null;
+    if (agent.stopped) { send(res, { type: 'system', stopped: true }); agent.stopped = false; }
+    else if (code && code !== 0) send(res, { type: 'error', error: stderr.trim() || `codex exited with code ${code}` });
+    agent.totals.turns += 1;
+    if (!agent.totals.history) agent.totals.history = [];
+    agent.totals.history.push({ ts: Date.now(), input: 0, output: 0, cache: 0, cost: 0, engine: 'codex' });
+    agent.busy = false;
+    agent.sessionId = agent.sessionId || ('codex-' + agent.id);
+    saveData();
+    send(res, { type: 'done' });
+    res.end();
+  });
+
+  child.on('error', (err) => {
+    send(res, { type: 'error', error: 'Failed to start codex: ' + err.message });
+    agent.busy = false;
+    send(res, { type: 'done' });
+    res.end();
+  });
+}
+
+// ---------- Hermes turn (Nous Research Hermes Agent CLI, autonomous, provider-agnostic) ----------
+// Assumes the `hermes` CLI is installed (github.com/NousResearch/hermes-agent). Hermes is
+// model/provider-agnostic (OpenRouter / OpenAI / Anthropic / Gemini), so it takes a provider +
+// model like OpenClaw. NOTE: the exact non-interactive invocation below is a best-effort first
+// pass — confirm `hermes --help` on the target machine and adjust `args` if the flags differ.
+async function runHermesTurn(agent, text, res) {
+  agent.busy = true;
+  res.writeHead(200, { 'Content-Type': 'application/x-ndjson; charset=utf-8', 'Cache-Control': 'no-cache' });
+
+  const provider = (agent.hermesProvider || '').trim();
+  const model = (agent.hermesModel || '').trim();
+  if (!model) {
+    send(res, { type: 'error', error: 'Hermes agent needs a Model (open ✎ Edit to set it). Provider is optional (e.g. openrouter/anthropic).' });
+    agent.busy = false; send(res, { type: 'done' }); return res.end();
+  }
+  const fullModel = provider ? provider + '/' + model : model;
+
+  let toSend = text;
+  if (!agent.primedSoul) {
+    const persona = buildPersona(agent, { withContents: true });
+    if (persona) toSend = persona + '\n\n=== YOUR TASK ===\n' + text;
+    agent.primedSoul = true;
+  }
+
+  const env = { ...process.env };
+  const apiKey = (agent.hermesApiKey || '').trim();
+  if (apiKey) {
+    if (provider === 'openrouter') env.OPENROUTER_API_KEY = apiKey;
+    else if (provider === 'openai') env.OPENAI_API_KEY = apiKey;
+    else if (provider === 'anthropic') env.ANTHROPIC_API_KEY = apiKey;
+    else if (provider === 'google' || provider === 'gemini') { env.GOOGLE_API_KEY = apiKey; env.GEMINI_API_KEY = apiKey; }
+    else env[(provider || 'HERMES').toUpperCase().replace(/[^A-Z0-9]/g, '_') + '_API_KEY'] = apiKey;
+  }
+
+  // Best-effort headless invocation — adjust to the real Hermes CLI contract if needed.
+  const args = ['--message', toSend, '--model', fullModel, '--json'];
+
+  let child;
+  try { child = spawn('hermes', args, { cwd: agent.cwd, shell: true, env }); }
+  catch (e) { send(res, { type: 'error', error: 'Failed to start hermes: ' + String(e) }); agent.busy = false; send(res, { type: 'done' }); return res.end(); }
+
+  agent.child = child;
+  agent.stopped = false;
+
+  const extractText = (evt) => {
+    if (!evt || typeof evt !== 'object') return '';
+    if (typeof evt.text === 'string') return evt.text;
+    if (typeof evt.content === 'string') return evt.content;
+    if (typeof evt.message === 'string') return evt.message;
+    if (typeof evt.delta === 'string') return evt.delta;
+    const it = evt.item || evt.msg || {};
+    if (typeof it.text === 'string') return it.text;
+    if (typeof it.message === 'string') return it.message;
+    return '';
+  };
+
+  let buf = '';
+  child.stdout.on('data', (chunk) => {
+    buf += chunk.toString();
+    let idx;
+    while ((idx = buf.indexOf('\n')) >= 0) {
+      const line = buf.slice(0, idx).trim();
+      buf = buf.slice(idx + 1);
+      if (!line) continue;
+      let evt;
+      try { evt = JSON.parse(line); } catch { send(res, { type: 'text', text: line }); continue; }
+      const t = extractText(evt);
+      const kind = evt.type || (evt.item && evt.item.type) || (evt.msg && evt.msg.type) || '';
+      if (/tool|command|skill|browser|search|patch|file/i.test(String(kind)) && !t) {
+        send(res, { type: 'tool', name: String(kind), input: evt.input || evt.args || evt.item || {} });
+      } else if (t) {
+        send(res, { type: 'text', text: t });
+      }
+    }
+  });
+
+  let stderr = '';
+  child.stderr.on('data', (c) => (stderr += c.toString()));
+
+  child.on('close', (code) => {
+    if (buf.trim()) {
+      try { const evt = JSON.parse(buf.trim()); const t = extractText(evt); if (t) send(res, { type: 'text', text: t }); else send(res, { type: 'text', text: buf.trim() }); }
+      catch { send(res, { type: 'text', text: buf.trim() }); }
+    }
+    agent.child = null;
+    if (agent.stopped) { send(res, { type: 'system', stopped: true }); agent.stopped = false; }
+    else if (code && code !== 0) send(res, { type: 'error', error: stderr.trim() || `hermes exited with code ${code}` });
+    agent.totals.turns += 1;
+    if (!agent.totals.history) agent.totals.history = [];
+    agent.totals.history.push({ ts: Date.now(), input: 0, output: 0, cache: 0, cost: 0, engine: 'hermes' });
+    agent.busy = false;
+    agent.sessionId = agent.sessionId || ('hermes-' + agent.id);
+    saveData();
+    send(res, { type: 'done' });
+    res.end();
+  });
+
+  child.on('error', (err) => {
+    send(res, { type: 'error', error: 'Failed to start hermes: ' + err.message });
+    agent.busy = false;
+    send(res, { type: 'done' });
+    res.end();
+  });
+}
+
 // ---------- Router ----------
 const server = http.createServer(async (req, res) => {
   const { pathname } = new URL(req.url, 'http://localhost');
@@ -466,6 +686,7 @@ const server = http.createServer(async (req, res) => {
 
   if (pathname === '/') return serveStatic(res, 'index.html');
   if (pathname === '/app.js') return serveStatic(res, 'app.js');
+  if (pathname === '/reel-ui.js') return serveStatic(res, 'reel-ui.js');
 
   if (pathname === '/api/state' && method === 'GET') return json(res, 200, publicState());
 
@@ -567,6 +788,18 @@ const server = http.createServer(async (req, res) => {
       let out = '';
       child.stdout.on('data', (d) => out += d);
       child.on('close', (code) => json(res, 200, { ok: code === 0, output: out.trim() }));
+    } catch (e) { json(res, 500, { ok: false, error: e.message }); }
+    return;
+  }
+
+  // Open a terminal window running `claude setup-token`. The user completes the
+  // browser OAuth for whichever account they want, then copies the printed token
+  // into a Worker's "Claude account token" field. This does NOT touch the machine
+  // login — the token is used per-agent via CLAUDE_CODE_OAUTH_TOKEN.
+  if (pathname === '/api/account/setup-token' && method === 'POST') {
+    try {
+      spawn('start "" cmd /k claude setup-token', [], { shell: true, detached: true });
+      json(res, 200, { ok: true });
     } catch (e) { json(res, 500, { ok: false, error: e.message }); }
     return;
   }
@@ -687,9 +920,15 @@ const server = http.createServer(async (req, res) => {
       if (b.ccBaseUrl != null) agent.ccBaseUrl = b.ccBaseUrl;
       if (b.ccAuthToken != null) agent.ccAuthToken = b.ccAuthToken;
       if (b.ccModel != null) agent.ccModel = b.ccModel;
+      if (b.ccOauthToken != null) agent.ccOauthToken = b.ccOauthToken;
       if (b.ocProvider != null) agent.ocProvider = b.ocProvider;
       if (b.ocModel != null) agent.ocModel = b.ocModel;
       if (b.ocApiKey != null) agent.ocApiKey = b.ocApiKey;
+      if (b.codexModel != null) agent.codexModel = b.codexModel;
+      if (b.codexApiKey != null) agent.codexApiKey = b.codexApiKey;
+      if (b.hermesProvider != null) agent.hermesProvider = b.hermesProvider;
+      if (b.hermesModel != null) agent.hermesModel = b.hermesModel;
+      if (b.hermesApiKey != null) agent.hermesApiKey = b.hermesApiKey;
       saveData();
       return json(res, 200, publicAgent(agent));
     }
@@ -741,6 +980,12 @@ const server = http.createServer(async (req, res) => {
     if (idx >= 0) templates[idx] = tpl; else templates.push(tpl);
     saveTemplates();
     return json(res, 200, { templates });
+  }
+
+  // The Reel — mini-app routes (/api/reel/*)
+  if (pathname.startsWith('/api/reel/')) {
+    const handled = await reel.route(pathname, method, req, res, { json, readBody });
+    if (handled !== false) return;
   }
 
   res.writeHead(404);
