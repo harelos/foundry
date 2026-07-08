@@ -9,7 +9,10 @@
     briefs: [],
     posts: [],
     formulas: [],
-    settingsSet: { anthropic: false, higgsKeyId: false, higgsKeySecret: false },
+    accounts: [],
+    activeAccountId: '',
+    settingsSet: { anthropic: false, higgsKeyId: false, higgsKeySecret: false, publicBaseUrl: '' },
+    publishing: false,
     view: 'home',              // home | briefEditor | brief | generator | result | settings
     selectedBriefId: null,
     selectedPostId: null,
@@ -70,6 +73,8 @@
       state.briefs = s.briefs || [];
       state.posts = s.posts || [];
       state.formulas = s.formulas || [];
+      state.accounts = s.accounts || [];
+      state.activeAccountId = s.activeAccountId || '';
       state.settingsSet = s.settingsSet || {};
     } catch (e) { state.lastError = e.message; }
   }
@@ -297,6 +302,21 @@
         });
     }
     side.append(scroll);
+
+    // Account switcher (only when accounts exist)
+    if (state.accounts.length) {
+      const accBar = h('div', { style: { padding: '10px 12px', borderTop: '1px solid var(--line)', display: 'flex', alignItems: 'center', gap: '8px' } });
+      accBar.append(h('span', { style: { fontSize: '10px', color: 'var(--muted)', fontFamily: 'var(--font-mono)', textTransform: 'uppercase', letterSpacing: '0.5px' } }, 'Posting as'));
+      const sel = h('select', { style: { flex: 1, background: 'var(--input)', color: 'var(--text)', border: '1px solid var(--line)', borderRadius: '6px', padding: '5px 8px', font: '12px var(--font-body)' } });
+      state.accounts.forEach((acct) => {
+        const o = h('option', { value: acct.id }, acct.label + (acct.hasToken ? '' : ' (no token)'));
+        if (acct.id === state.activeAccountId) o.selected = true;
+        sel.append(o);
+      });
+      sel.addEventListener('change', async () => { try { await api('/account/active', { method: 'POST', body: { id: sel.value } }); await refresh(); render(container); } catch (e) { state.lastError = e.message; render(container); } });
+      accBar.append(sel);
+      side.append(accBar);
+    }
 
     const foot = h('div', { class: 'reel-side-foot' });
     foot.append(
@@ -744,12 +764,46 @@
     );
 
     // Toolbar
+    const hasImages = p.slides.some((s) => s.imageLocal);
+    const activeAcct = state.accounts.find((x) => x.id === state.activeAccountId);
     const tb = h('div', { class: 'reel-toolbar' });
     tb.append(
       h('button', {
         class: 'reel-btn ghost',
         onclick: () => { state.view = 'generator'; render(container); }
       }, '＋ Regenerate (new)'),
+      hasImages ? h('button', {
+        class: 'reel-btn',
+        title: 'Download every slide image',
+        onclick: () => {
+          p.slides.forEach((s, i) => {
+            if (!s.imageLocal) return;
+            const aEl = document.createElement('a');
+            aEl.href = '/api/reel/asset/' + s.imageLocal;
+            aEl.download = 'slide_' + (i + 1) + '.png';
+            document.body.appendChild(aEl); aEl.click(); aEl.remove();
+          });
+          state.genProgress = 'Downloading ' + p.slides.filter((s) => s.imageLocal).length + ' slides';
+          setTimeout(() => { state.genProgress = ''; render(container); }, 1500);
+        }
+      }, '⬇ Download all') : null,
+      h('button', {
+        class: 'reel-btn primary',
+        disabled: state.publishing || !hasImages,
+        title: activeAcct ? ('Publish to TikTok as ' + activeAcct.label) : 'Add a TikTok account in Settings first',
+        onclick: async () => {
+          if (!activeAcct) { state.view = 'settings'; render(container); return; }
+          state.publishing = true; state.lastError = ''; render(container);
+          try {
+            const r = await api('/post/' + p.id + '/publish', { method: 'POST', body: {} });
+            state.publishing = false;
+            state.genProgress = 'Sent ' + r.imageCount + ' slides to TikTok (' + r.postMode + ') as ' + r.account;
+            await refresh();
+            render(container);
+            setTimeout(() => { state.genProgress = ''; render(container); }, 4000);
+          } catch (e) { state.publishing = false; state.lastError = e.message; render(container); }
+        }
+      }, state.publishing ? 'Publishing…' : ('▶ Publish to TikTok' + (activeAcct ? ' · ' + activeAcct.label : ''))),
       h('div', { class: 'spacer' }),
       h('button', {
         class: 'reel-btn danger small',
@@ -761,6 +815,11 @@
       }, 'Delete')
     );
     main.append(tb);
+    if (state.lastError) { main.append(h('div', { class: 'reel-error' }, state.lastError)); state.lastError = ''; }
+    if (p.published && p.published.length) {
+      main.append(h('div', { style: { fontSize: '12px', color: 'var(--accent2)', fontFamily: 'var(--font-mono)', marginBottom: '8px' } },
+        '✓ Published ' + p.published.length + '× — last: ' + (p.published[p.published.length - 1].label || '') + (p.published[p.published.length - 1].publishId ? ' (' + p.published[p.published.length - 1].publishId + ')' : '')));
+    }
 
     // Slides — each with edit + regen actions
     const slides = h('div', { class: 'reel-slides' });
@@ -1009,7 +1068,14 @@
     const k = mkKeyField('higgsKeyId', 'Higgsfield key ID', 'From cloud.higgsfield.ai → API Keys. UUID format.', state.settingsSet.higgsKeyId);
     const s = mkKeyField('higgsKeySecret', 'Higgsfield key secret', 'The secret shown once when you created the API key.', state.settingsSet.higgsKeySecret);
 
-    form.append(a.field, k.field, s.field);
+    // Public base URL (for TikTok publishing — TikTok pulls images from a reachable URL)
+    const pubField = h('div', { class: 'reel-field' });
+    pubField.append(h('label', {}, 'Public base URL (for TikTok publishing)'));
+    const pubInput = h('input', { type: 'text', placeholder: 'e.g. https://your-tunnel.ngrok.io' });
+    pubInput.value = state.settingsSet.publicBaseUrl || '';
+    pubField.append(pubInput, h('div', { class: 'hint' }, 'TikTok fetches slide images from public URLs, so a localhost server is not reachable. Point this at a tunnel (ngrok, cloudflared) forwarding to this server. Leave blank if you only export manually.'));
+
+    form.append(a.field, k.field, s.field, pubField);
 
     if (state.lastError) form.append(h('div', { class: 'reel-error' }, state.lastError));
 
@@ -1022,8 +1088,8 @@
           if (a.input.value) body.anthropicKey = a.input.value;
           if (k.input.value) body.higgsKeyId = k.input.value;
           if (s.input.value) body.higgsKeySecret = s.input.value;
-          if (!Object.keys(body).length) { state.view = 'home'; render(container); return; }
-          try { await api('/settings', { method: 'POST', body }); await refresh(); state.view = 'home'; render(container); }
+          body.publicBaseUrl = pubInput.value.trim();
+          try { await api('/settings', { method: 'POST', body }); await refresh(); render(container); }
           catch (e) { state.lastError = e.message; render(container); }
         }
       }, 'Save settings'),
@@ -1034,8 +1100,63 @@
     );
     form.append(actions);
     main.append(form);
+
+    // ---- Accounts ----
+    main.append(renderAccountsSection());
     state.lastError = '';
     return main;
+  }
+
+  function renderAccountsSection() {
+    const wrap = h('div', { style: { marginTop: '36px', maxWidth: '640px' } });
+    wrap.append(
+      h('h3', { class: 'reel-section-title' }, 'Social accounts', h('span', { class: 'num' }, String(state.accounts.length))),
+      h('div', { class: 'reel-subtitle', style: { marginBottom: '14px' } }, 'connect the TikTok accounts you post from. switch the active one here or in the header.')
+    );
+
+    if (state.accounts.length) {
+      const list = h('div', { style: { display: 'grid', gap: '8px', marginBottom: '18px' } });
+      state.accounts.forEach((acct) => {
+        const isActive = acct.id === state.activeAccountId;
+        const row = h('div', {
+          class: 'reel-info-cell',
+          style: { display: 'flex', alignItems: 'center', gap: '12px', padding: '12px 14px', borderColor: isActive ? 'var(--accent)' : 'var(--line)' }
+        },
+          h('span', { style: { width: '8px', height: '8px', borderRadius: '50%', background: acct.hasToken ? 'var(--accent2)' : 'var(--dim)', flexShrink: 0 } }),
+          h('div', { style: { flex: 1 } },
+            h('div', { style: { fontWeight: 600 } }, acct.label, isActive ? h('span', { class: 'b-count', style: { marginLeft: '8px', background: 'var(--accent)', color: '#141210' } }, 'active') : ''),
+            h('div', { style: { fontSize: '11px', color: 'var(--muted)', fontFamily: 'var(--font-mono)' } }, (acct.platform || 'tiktok').toUpperCase() + (acct.hasToken ? ' · token set' : ' · no token'))
+          ),
+          !isActive ? h('button', { class: 'reel-btn small', onclick: async () => { try { await api('/account/active', { method: 'POST', body: { id: acct.id } }); await refresh(); render(container); } catch (e) { state.lastError = e.message; render(container); } } }, 'Set active') : null,
+          h('button', { class: 'reel-btn small danger', onclick: async () => { if (!confirm('Remove account "' + acct.label + '"?')) return; try { await api('/account/' + acct.id, { method: 'DELETE' }); await refresh(); render(container); } catch (e) { state.lastError = e.message; render(container); } } }, 'Remove')
+        );
+        list.append(row);
+      });
+      wrap.append(list);
+    } else {
+      wrap.append(h('div', { class: 'reel-empty', style: { padding: '20px' } }, h('p', {}, 'No accounts yet. Add your first TikTok account below.')));
+    }
+
+    // Add-account mini form
+    const labelIn = h('input', { type: 'text', placeholder: 'Account label (e.g. "Dopamodoro main")' });
+    const tokenIn = h('input', { type: 'text', placeholder: 'TikTok access token (from your TikTok developer app OAuth)' });
+    const openIn = h('input', { type: 'text', placeholder: 'open_id (optional)' });
+    [labelIn, tokenIn, openIn].forEach((i) => { i.style.cssText = 'width:100%;background:var(--input);border:1px solid var(--line);border-radius:8px;color:var(--text);padding:10px 12px;margin-bottom:8px;font:14px var(--font-body);'; });
+    const addBox = h('div', { class: 'reel-info-cell', style: { padding: '16px 18px' } },
+      h('h4', { style: { margin: '0 0 10px', fontSize: '11px', letterSpacing: '0.5px', textTransform: 'uppercase', color: 'var(--muted)', fontFamily: 'var(--font-mono)' } }, '+ Add TikTok account'),
+      labelIn, tokenIn, openIn,
+      h('button', {
+        class: 'reel-btn primary small',
+        onclick: async () => {
+          if (!labelIn.value.trim()) { labelIn.focus(); return; }
+          try { await api('/account', { method: 'POST', body: { label: labelIn.value.trim(), platform: 'tiktok', accessToken: tokenIn.value.trim(), openId: openIn.value.trim() } }); await refresh(); render(container); }
+          catch (e) { state.lastError = e.message; render(container); }
+        }
+      }, 'Add account'),
+      h('div', { class: 'hint', style: { marginTop: '8px' } }, 'Get a token from your registered TikTok developer app (Content Posting API scope). Direct public posting needs an audited app; unaudited apps post to your TikTok inbox as a draft.')
+    );
+    wrap.append(addBox);
+    return wrap;
   }
 
   // ---------- Public API ----------

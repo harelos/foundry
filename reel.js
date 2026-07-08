@@ -11,7 +11,12 @@ const DATA_FILE = path.join(__dirname, 'reel-data.json');
 const ASSETS_DIR = path.join(__dirname, 'mc-uploads', 'reel');
 fs.mkdirSync(ASSETS_DIR, { recursive: true });
 
-let db = { briefs: [], posts: [], settings: { anthropicKey: '', higgsKeyId: '', higgsKeySecret: '' } };
+let db = {
+  briefs: [], posts: [],
+  accounts: [],            // [{ id, label, platform, accessToken, openId, addedAt }]
+  activeAccountId: '',
+  settings: { anthropicKey: '', higgsKeyId: '', higgsKeySecret: '', publicBaseUrl: '' },
+};
 
 function load() {
   try {
@@ -19,6 +24,8 @@ function load() {
       const d = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
       db.briefs = d.briefs || [];
       db.posts = d.posts || [];
+      db.accounts = d.accounts || [];
+      db.activeAccountId = d.activeAccountId || '';
       db.settings = { ...db.settings, ...(d.settings || {}) };
     }
   } catch (e) { console.log('  (reel: could not load reel-data.json:', e.message, ')'); }
@@ -277,6 +284,49 @@ function parseCopyJson(text) {
 // ---------- Business logic ----------
 function findBrief(id) { return db.briefs.find((b) => b.id === id); }
 function findPost(id) { return db.posts.find((p) => p.id === id); }
+function findAccount(id) { return db.accounts.find((a) => a.id === id); }
+
+// Publish a carousel's slides to TikTok via the official Content Posting API (photo mode).
+// TikTok PULLS the images from public URLs, so slide assets must be reachable from the
+// internet — set settings.publicBaseUrl to a tunnel (e.g. ngrok) pointing at this server.
+// Unaudited dev apps can only send to the TikTok inbox as a draft (post_mode MEDIA_UPLOAD,
+// privacy SELF_ONLY); DIRECT_POST needs an audited app. Defaults are chosen accordingly.
+async function tiktokPublish(account, post, opts = {}) {
+  if (!account || !account.accessToken) throw new Error('This TikTok account has no access token. Add one in Accounts.');
+  const base = (db.settings.publicBaseUrl || '').trim().replace(/\/$/, '');
+  if (!base) throw new Error('TikTok pulls images from public URLs. Set a Public base URL (a tunnel like ngrok pointing at this server) in Settings first.');
+  if (/localhost|127\.0\.0\.1/.test(base)) throw new Error('Public base URL cannot be localhost — TikTok\'s servers must be able to reach it. Use a public tunnel URL.');
+
+  const images = post.slides.filter((s) => s.imageLocal).map((s) => `${base}/api/reel/asset/${s.imageLocal}`);
+  if (!images.length) throw new Error('No generated slide images to publish.');
+
+  const body = JSON.stringify({
+    post_info: {
+      title: (post.caption || '').slice(0, 90),
+      description: [(post.caption || ''), (post.hashtags || []).join(' ')].filter(Boolean).join('\n\n').slice(0, 4000),
+      privacy_level: opts.privacyLevel || 'SELF_ONLY',
+      disable_comment: false,
+    },
+    source_info: { source: 'PULL_FROM_URL', photo_cover_index: 0, photo_images: images },
+    post_mode: opts.postMode || 'MEDIA_UPLOAD',   // MEDIA_UPLOAD = draft in TikTok inbox (works for unaudited apps)
+    media_type: 'PHOTO',
+  });
+  const r = await httpsRequest('https://open.tiktokapis.com/v2/post/publish/content/init/', {
+    method: 'POST',
+    headers: {
+      'Authorization': 'Bearer ' + account.accessToken,
+      'Content-Type': 'application/json; charset=UTF-8',
+      'Content-Length': Buffer.byteLength(body),
+    },
+  }, body);
+  let data = {};
+  try { data = JSON.parse(r.body.toString()); } catch {}
+  if (r.status !== 200 || (data.error && data.error.code && data.error.code !== 'ok')) {
+    const msg = (data.error && (data.error.message || data.error.code)) || r.body.toString().slice(0, 200);
+    throw new Error(`TikTok ${r.status}: ${msg}`);
+  }
+  return { publishId: data.data && data.data.publish_id, imageCount: images.length, postMode: opts.postMode || 'MEDIA_UPLOAD' };
+}
 
 async function generateCarousel(briefId, opts) {
   const brief = findBrief(briefId);
@@ -381,11 +431,15 @@ async function route(pathname, method, req, res, helpers) {
         id: p.id, briefId: p.briefId, type: p.type, caption: p.caption, hashtags: p.hashtags,
         slides: p.slides.map((s) => ({ copy: s.copy, imagePrompt: s.imagePrompt, imageLocal: s.imageLocal, imageError: s.imageError })),
         status: p.status, createdAt: p.createdAt, hookStyle: p.hookStyle, format: p.format, formulaId: p.formulaId, language: p.language,
+        published: p.published || [],
       })),
+      accounts: db.accounts.map((a) => ({ id: a.id, label: a.label, platform: a.platform || 'tiktok', hasToken: !!a.accessToken })),
+      activeAccountId: db.activeAccountId,
       settingsSet: {
         anthropic: !!db.settings.anthropicKey,
         higgsKeyId: !!db.settings.higgsKeyId,
         higgsKeySecret: !!db.settings.higgsKeySecret,
+        publicBaseUrl: db.settings.publicBaseUrl || '',
       },
     });
   }
@@ -396,8 +450,53 @@ async function route(pathname, method, req, res, helpers) {
     if (b.anthropicKey !== undefined) db.settings.anthropicKey = String(b.anthropicKey || '').trim();
     if (b.higgsKeyId !== undefined) db.settings.higgsKeyId = String(b.higgsKeyId || '').trim();
     if (b.higgsKeySecret !== undefined) db.settings.higgsKeySecret = String(b.higgsKeySecret || '').trim();
+    if (b.publicBaseUrl !== undefined) db.settings.publicBaseUrl = String(b.publicBaseUrl || '').trim();
     save();
     return json(res, 200, { ok: true });
+  }
+
+  // ---- Social accounts (TikTok etc.) ----
+  if (pathname === '/api/reel/account' && method === 'POST') {
+    const b = await readBody(req);
+    if (b.id) {
+      const acct = findAccount(b.id);
+      if (!acct) return json(res, 404, { error: 'Account not found' });
+      if (b.label !== undefined) acct.label = String(b.label || '').trim() || acct.label;
+      if (b.platform !== undefined) acct.platform = b.platform || acct.platform;
+      if (b.accessToken) acct.accessToken = String(b.accessToken).trim();   // keep old if blank
+      if (b.openId !== undefined) acct.openId = String(b.openId || '').trim();
+      save();
+      return json(res, 200, { id: acct.id, label: acct.label, platform: acct.platform, hasToken: !!acct.accessToken });
+    }
+    const acct = {
+      id: randomUUID().slice(0, 8),
+      label: String(b.label || '').trim() || 'Untitled account',
+      platform: b.platform || 'tiktok',
+      accessToken: String(b.accessToken || '').trim(),
+      openId: String(b.openId || '').trim(),
+      addedAt: Date.now(),
+    };
+    db.accounts.push(acct);
+    if (!db.activeAccountId) db.activeAccountId = acct.id;
+    save();
+    return json(res, 200, { id: acct.id, label: acct.label, platform: acct.platform, hasToken: !!acct.accessToken });
+  }
+  const acctDelMatch = pathname.match(/^\/api\/reel\/account\/([^/]+)$/);
+  if (acctDelMatch && method === 'DELETE') {
+    const aid = acctDelMatch[1];
+    const idx = db.accounts.findIndex((a) => a.id === aid);
+    if (idx < 0) return json(res, 404, { error: 'Account not found' });
+    db.accounts.splice(idx, 1);
+    if (db.activeAccountId === aid) db.activeAccountId = db.accounts[0] ? db.accounts[0].id : '';
+    save();
+    return json(res, 200, { ok: true });
+  }
+  if (pathname === '/api/reel/account/active' && method === 'POST') {
+    const b = await readBody(req);
+    if (b.id && !findAccount(b.id)) return json(res, 404, { error: 'Account not found' });
+    db.activeAccountId = b.id || '';
+    save();
+    return json(res, 200, { ok: true, activeAccountId: db.activeAccountId });
   }
 
   // Briefs
@@ -555,6 +654,25 @@ async function route(pathname, method, req, res, helpers) {
     if (Array.isArray(b.hashtags)) post.hashtags = b.hashtags;
     save();
     return json(res, 200, { caption: post.caption, hashtags: post.hashtags });
+  }
+
+  // Publish a post to TikTok (active account, or one named in the body)
+  if ((m = pathname.match(/^\/api\/reel\/post\/([^/]+)\/publish$/)) && method === 'POST') {
+    const post = findPost(m[1]);
+    if (!post) return json(res, 404, { error: 'Post not found' });
+    const b = await readBody(req);
+    const account = findAccount(b.accountId || db.activeAccountId);
+    if (!account) return json(res, 400, { error: 'No TikTok account selected. Add one and pick it as active in Accounts.' });
+    try {
+      const r = await tiktokPublish(account, post, { postMode: b.postMode, privacyLevel: b.privacyLevel });
+      post.published = post.published || [];
+      post.published.push({ accountId: account.id, label: account.label, publishId: r.publishId, postMode: r.postMode, at: Date.now() });
+      save();
+      return json(res, 200, { ok: true, ...r, account: account.label });
+    } catch (e) {
+      console.log('  (reel: publish failed:', e.message, ')');
+      return json(res, 400, { error: e.message });
+    }
   }
 
   // Delete post

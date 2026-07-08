@@ -257,6 +257,7 @@ function renderFocus() {
 
     if (meta.ccModel || meta.ccBaseUrl) meta_.append(makeMetaTag('⇄ ' + (meta.ccModel || 'proxy'), null));
   }
+  meta_.append(makeAccountChip(meta));
   head.append(meta_);
 
   const actions = el('div', 'focus-actions');
@@ -291,6 +292,7 @@ function renderFocus() {
   // Restore prior msgs if we have them cached
   const prev = cardCache.get(meta.id);
   if (prev) prev.forEach((n) => transcript.appendChild(n.cloneNode(true)));
+  wireCopyButtons(transcript);   // cloned nodes lose onclick handlers — re-wire copy buttons
   ws.append(transcript);
 
   // Drag-drop
@@ -326,6 +328,17 @@ function renderFocus() {
 
   const c = { meta, card: ws, transcript, ta, dot, send: sendBtn, stop: stopBtn, fileInput, attachments: attach, pending: [] };
   cards.set(meta.id, c);
+
+  // Jump-to-latest chip — appears when scrolled up during streaming.
+  ws.style.position = 'relative';
+  const jump = el('div', 'jump-latest'); jump.textContent = '↓ Latest';
+  jump.onclick = () => { transcript.scrollTop = transcript.scrollHeight; jump.classList.remove('show'); };
+  ws.append(jump);
+  c.jumpBtn = jump;
+  transcript.addEventListener('scroll', () => {
+    const dist = transcript.scrollHeight - transcript.scrollTop - transcript.clientHeight;
+    if (dist < 60) jump.classList.remove('show');
+  });
 
   // Autofocus composer
   setTimeout(() => ta.focus(), 40);
@@ -398,6 +411,11 @@ function makeCard(meta) {
   subRow.append(dot);
   subRow.append(el('span', null, meta.busy ? 'Working' : (meta.hasSession ? 'Ready' : 'Idle')));
   if (meta.reportsTo) subRow.append(el('span', null, ' · ↳ ' + meta.reportsTo));
+  if (meta.loop && meta.loop.active) {
+    const lp = meta.loop;
+    const cap = lp.maxIterations ? '/' + lp.maxIterations : '';
+    subRow.append(el('span', 'loop-badge', '🔁 loop ' + (lp.iterations || 0) + cap));
+  }
   title.append(subRow);
   head.append(title);
 
@@ -413,6 +431,9 @@ function makeCard(meta) {
   else if (meta.engine === 'codex') ctrl.append(makeMetaTag('CODEX ' + (meta.codexModel || 'default'), 'oc'));
   else if (meta.engine === 'hermes') ctrl.append(makeMetaTag('HERMES ' + (meta.hermesProvider ? meta.hermesProvider + '/' : '') + (meta.hermesModel || '?'), 'oc'));
 
+  const loopBtn = mkIcon('🔁', 'Loop — run autonomously until stopped', () => openLoopModal(meta.id));
+  if (meta.loop && meta.loop.active) loopBtn.classList.add('loop-on');
+  ctrl.append(loopBtn);
   ctrl.append(mkIcon('💾', 'Save', () => saveSession(meta.id)));
   ctrl.append(mkIcon('✎', 'Edit', () => openWorker(meta.id)));
   const del = mkIcon('✕', 'Remove', () => removeWorker(meta.id)); del.classList.add('x');
@@ -467,39 +488,86 @@ function makeCard(meta) {
 // ---- Message / dispatch ----
 function addMsg(c, cls, text) {
   const m = el('div', 'msg ' + cls);
-  c.transcript.appendChild(m);
-  // Assistant messages get a typewriter reveal — Claude Code CLI emits full blocks,
-  // not token-by-token, so we simulate the streaming feel client-side.
-  if (cls === 'assistant' && text && text.length > 24) {
-    typewriter(m, text, c.transcript);
+  if (cls === 'assistant') {
+    m.classList.add('md');
+    m.innerHTML = renderMarkdown(text);   // safe: content is escaped inside renderMarkdown
+    wireCopyButtons(m);
   } else {
     m.textContent = text || '';
-    c.transcript.scrollTop = c.transcript.scrollHeight;
   }
+  c.transcript.appendChild(m);
+  maybeScroll(c);
   return m;
 }
 
-function typewriter(node, text, scrollEl) {
-  // Reveal ~90 chars per animation frame → feels like fast confident typing.
-  // Blinking caret span at the tail while writing.
-  const caret = document.createElement('span');
-  caret.className = 'caret';
-  node.appendChild(caret);
-  let i = 0;
-  const chunkSize = 3;
-  const stepMs = 12;
-  const step = () => {
-    if (i >= text.length) {
-      caret.remove();
-      return;
+// Only auto-scroll if the user is already near the bottom; otherwise surface the
+// "jump to latest" chip so we never yank them away from what they're reading.
+function maybeScroll(c) {
+  const t = c.transcript; if (!t) return;
+  const dist = t.scrollHeight - t.scrollTop - t.clientHeight;
+  if (dist < 120) t.scrollTop = t.scrollHeight;
+  else if (c.jumpBtn) c.jumpBtn.classList.add('show');
+}
+
+function wireCopyButtons(root) {
+  root.querySelectorAll('.code-copy').forEach((btn) => {
+    btn.onclick = () => {
+      const code = btn.parentElement.querySelector('code');
+      const txt = code ? code.textContent : '';
+      (navigator.clipboard ? navigator.clipboard.writeText(txt) : Promise.reject()).then(() => {
+        btn.textContent = 'Copied'; btn.classList.add('done');
+        setTimeout(() => { btn.textContent = 'Copy'; btn.classList.remove('done'); }, 1400);
+      }).catch(() => { btn.textContent = 'Copy failed'; setTimeout(() => { btn.textContent = 'Copy'; }, 1400); });
+    };
+  });
+}
+
+// ---- Lightweight, XSS-safe Markdown → HTML (everything is escaped first) ----
+function renderMarkdown(src) {
+  const text = String(src == null ? '' : src);
+  const parts = text.split('```');   // odd indices are fenced code blocks
+  let html = '';
+  parts.forEach((part, idx) => {
+    if (idx % 2 === 1) {
+      const nl = part.indexOf('\n');
+      let lang = '', code = part;
+      if (nl >= 0) {
+        const first = part.slice(0, nl).trim();
+        if (/^[\w+.-]{1,20}$/.test(first)) { lang = first; code = part.slice(nl + 1); }
+      }
+      code = code.replace(/\n$/, '');
+      html += '<div class="code-wrap">'
+        + (lang ? '<span class="code-lang">' + esc(lang) + '</span>' : '')
+        + '<button class="code-copy" type="button">Copy</button>'
+        + '<pre><code>' + esc(code) + '</code></pre></div>';
+    } else {
+      html += mdBlocks(part);
     }
-    const slice = text.slice(i, i + chunkSize);
-    caret.insertAdjacentText('beforebegin', slice);
-    i += chunkSize;
-    if (scrollEl) scrollEl.scrollTop = scrollEl.scrollHeight;
-    node._twTimer = setTimeout(step, stepMs);
-  };
-  step();
+  });
+  return html;
+}
+function mdBlocks(block) {
+  let out = '', para = [], listBuf = [], listOrdered = false;
+  const flushList = () => { if (listBuf.length) { const tag = listOrdered ? 'ol' : 'ul'; out += '<' + tag + '>' + listBuf.map((li) => '<li>' + mdSpan(li) + '</li>').join('') + '</' + tag + '>'; listBuf = []; } };
+  const flushPara = () => { if (para.length) { out += '<p>' + para.map(mdSpan).join('<br>') + '</p>'; para = []; } };
+  block.split('\n').forEach((line) => {
+    let mm;
+    if ((mm = line.match(/^\s*(#{1,3})\s+(.+)$/))) { flushList(); flushPara(); const lv = mm[1].length; out += '<h' + lv + '>' + mdSpan(mm[2]) + '</h' + lv + '>'; }
+    else if ((mm = line.match(/^\s*[-*]\s+(.+)$/))) { flushPara(); if (listOrdered) flushList(); listOrdered = false; listBuf.push(mm[1]); }
+    else if ((mm = line.match(/^\s*\d+\.\s+(.+)$/))) { flushPara(); if (!listOrdered) flushList(); listOrdered = true; listBuf.push(mm[1]); }
+    else if (line.trim() === '') { flushList(); flushPara(); }
+    else { flushList(); para.push(line); }
+  });
+  flushList(); flushPara();
+  return out;
+}
+function mdSpan(s) {
+  let t = esc(s);
+  t = t.replace(/`([^`]+)`/g, (m, c) => '<code>' + c + '</code>');
+  t = t.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+  t = t.replace(/(^|[^*])\*([^*\s][^*]*)\*/g, '$1<em>$2</em>');
+  t = t.replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+  return t;
 }
 
 function parseAssignments(text) {
@@ -593,6 +661,7 @@ async function doSend(id, overrideText) {
     // Cache the transcript BEFORE refresh() rebuilds the DOM, or messages disappear.
     cacheTranscript(id);
     refresh();
+    maybeContinueLoop(id);
   }
 }
 
@@ -618,12 +687,10 @@ function renderEvent(c, evt) {
       break;
     }
     case 'tool': {
-      let d = evt.name; const i = evt.input || {};
-      if (i.command) d += ': ' + i.command;
-      else if (i.file_path) d += ': ' + i.file_path;
-      else if (i.pattern) d += ': ' + i.pattern;
-      addMsg(c, 'tool', '◆ ' + d);
-      logEvent(c.meta.id, 'tool', d);
+      const i = evt.input || {};
+      const target = i.command || i.file_path || i.pattern || i.url || i.path || '';
+      addToolCard(c, evt.name, target, i);
+      logEvent(c.meta.id, 'tool', evt.name + (target ? ': ' + target : ''));
       break;
     }
     case 'result':
@@ -639,6 +706,100 @@ function renderEvent(c, evt) {
       logEvent(c.meta.id, 'error', evt.error);
       break;
   }
+}
+
+// Collapsible tool-call card (click the summary to expand the full input).
+function addToolCard(c, name, target, input) {
+  const card = el('details', 'tool-card');
+  const sum = el('summary');
+  sum.innerHTML = '<span class="tc-icon">◆</span>'
+    + '<span class="tc-name">' + esc(name || 'tool') + '</span>'
+    + '<span class="tc-target">' + esc(target || '') + '</span>'
+    + '<span class="tc-caret">▸</span>';
+  card.append(sum);
+  const body = el('div', 'tc-body');
+  let detail = ''; try { detail = JSON.stringify(input || {}, null, 2); } catch { detail = String(target || ''); }
+  body.textContent = detail || '(no input)';
+  card.append(body);
+  c.transcript.appendChild(card);
+  maybeScroll(c);
+  return card;
+}
+
+// ---- Autonomous loop ----
+let loopAgentId = null;
+function openLoopModal(id) {
+  const a = findAgent(id); if (!a) return;
+  loopAgentId = id;
+  $('loopAgentName').textContent = '· ' + (a.role || a.name);
+  const lp = a.loop || {};
+  $('loopPrompt').value = lp.prompt || '';
+  $('loopMinutes').value = lp.maxMs ? Math.round(lp.maxMs / 60000) : '';
+  $('loopIterations').value = lp.maxIterations || '';
+  $('loopBudget').value = lp.maxCostUsd || '';
+  openModal('loopModal');
+}
+async function startLoop() {
+  const id = loopAgentId; if (!id) return;
+  const prompt = $('loopPrompt').value.trim();
+  if (!prompt) { $('loopPrompt').focus(); return; }
+  const body = {
+    action: 'start', prompt,
+    maxMinutes: parseFloat($('loopMinutes').value) || 0,
+    maxIterations: parseInt($('loopIterations').value, 10) || 0,
+    maxCostUsd: parseFloat($('loopBudget').value) || 0,
+  };
+  try {
+    await api('/api/agents/' + id + '/loop', 'POST', body);
+    closeModals();
+    await refresh();               // repaint card with the loop badge
+    doSend(id, prompt);            // fire the first turn; finally{} chains the rest
+  } catch (e) { alert('Could not start loop: ' + e.message); }
+}
+// Called from doSend's finally after each turn. Asks the server whether to run again.
+async function maybeContinueLoop(id) {
+  const c = cards.get(id);
+  if (!c || !c.meta || !c.meta.loop || !c.meta.loop.active) return;
+  let r;
+  try { r = await api('/api/agents/' + id + '/loop', 'POST', { action: 'tick' }); }
+  catch { return; }
+  if (r && r.continue) {
+    setTimeout(() => { const cc = cards.get(id); if (cc && !cc.meta.busy) doSend(id, r.prompt || c.meta.loop.prompt); }, 1500);
+  } else {
+    const cc = cards.get(id);
+    if (cc) addMsg(cc, 'system', '🔁 Loop ended — ' + ((r && r.reason) || 'stopped'));
+    refresh();
+  }
+}
+
+// ---- Accounts (Track C) ----
+function accountFor(agent) { return (S.accounts || []).find((x) => x.id === agent.accountId); }
+function accountKey(agent) { return agent.accountId || 'machine'; }
+function makeAccountChip(agent) {
+  const acc = accountFor(agent);
+  const chip = el('div', 'acct-chip');
+  const sw = el('span', 'acct-swatch'); sw.style.background = acc ? (acc.color || '#E8A33D') : '#6b6b6b';
+  chip.append(sw);
+  chip.append(el('span', null, acc ? acc.name : 'Machine login'));
+  // Collision guard: two RUNNING workers on the same account corrupt Claude's
+  // Projects/Chat/Cowork sync (see Multi-Claude bug report). Warn loudly.
+  const busySame = projectAgents().filter((a) => a.busy && accountKey(a) === accountKey(agent));
+  if (busySame.length > 1) {
+    chip.classList.add('warn');
+    chip.append(el('span', null, ' ⚠'));
+    chip.title = '⚠ ' + busySame.length + ' running workers share this account. Claude\'s Projects/Chat sync can break — give them separate accounts.';
+  } else {
+    chip.title = acc ? ('Runs on account: ' + acc.name) : "Runs on this machine's Claude login";
+  }
+  return chip;
+}
+function fillAccountOptions(sel, currentVal) {
+  sel.innerHTML = '';
+  const def = el('option', null, 'Machine login (default)'); def.value = ''; sel.appendChild(def);
+  (S.accounts || []).forEach((acc) => {
+    const o = el('option', null, acc.name + (acc.provider && acc.provider !== 'claude' ? ' (' + acc.provider + ')' : ''));
+    o.value = acc.id; if (acc.id === (currentVal || '')) o.selected = true; sel.appendChild(o);
+  });
 }
 
 // ---- Files ----
@@ -710,6 +871,8 @@ function openWorker(id, presetReports) {
   $('wmTitle').textContent = id ? 'Edit Worker' : 'Add Worker';
   $('wmName').value = a ? (a.role || a.name) : '';
   fillReportsOptions($('wmReports'), a ? a.reportsTo : (presetReports || ''), a ? (a.role || a.name) : '');
+  fillAccountOptions($('wmAccount'), a ? a.accountId : '');
+  $('wmAccountManage').onclick = () => { closeModals(); openAccountModal(); };
   fillModelOptions($('wmModel'), a ? a.model : '');
   $('wmEffort').value = a ? (a.effort || '') : '';
   $('wmEngine').value = a ? (a.engine || 'claude-code') : 'claude-code';
@@ -731,15 +894,20 @@ function openWorker(id, presetReports) {
   $('wmSoul').value = a ? a.soul : '';
   $('wmCcOauthGet').onclick = async () => {
     const btn = $('wmCcOauthGet');
-    btn.disabled = true; btn.textContent = 'Opening…';
+    btn.disabled = true; btn.textContent = 'Authorize in browser…';
     try {
       const r = await api('/api/account/setup-token', 'POST');
-      alert(r && r.ok
-        ? 'A terminal window opened running `claude setup-token`.\n\nApprove the account you want in the browser, then copy the printed token and paste it into the field.'
-        : 'Could not open the terminal: ' + ((r && r.error) || 'unknown error') + '\n\nRun `claude setup-token` manually and paste the token here.');
+      if (r.token) {
+        $('wmCcOauth').value = r.token;
+        btn.textContent = 'Token captured ✓';
+        setTimeout(() => { btn.textContent = 'Get token'; btn.disabled = false; }, 2000);
+      } else {
+        alert('No token captured yet.' + (r.url ? '\n\nOpen this URL, click Authorize, then press Get token again:\n' + r.url : '\n\nMake sure you click Authorize in the browser, then try again.'));
+        btn.textContent = 'Get token'; btn.disabled = false;
+      }
     } catch (e) {
-      alert('Could not open the terminal. Run `claude setup-token` manually and paste the token here.');
-    } finally { btn.disabled = false; btn.textContent = 'Get token'; }
+      alert('Failed: ' + (e.message || e)); btn.textContent = 'Get token'; btn.disabled = false;
+    }
   };
   syncEngineFields();
   openModal('workerModal');
@@ -748,7 +916,7 @@ async function saveWorker() {
   const proj = activeProject(); if (!proj) return;
   const body = {
     name: $('wmName').value.trim(), role: $('wmName').value.trim(),
-    reportsTo: $('wmReports').value, model: $('wmModel').value,
+    reportsTo: $('wmReports').value, model: $('wmModel').value, accountId: $('wmAccount').value,
     effort: $('wmEffort').value, soul: $('wmSoul').value, engine: $('wmEngine').value,
     apiBaseUrl: $('wmApiBase').value.trim(), apiKey: $('wmApiKey').value.trim(), apiModel: $('wmApiModel').value.trim(),
     ccBaseUrl: $('wmCcBase').value.trim(), ccAuthToken: $('wmCcToken').value.trim(), ccModel: $('wmCcModel').value.trim(), ccOauthToken: $('wmCcOauth').value.trim(),
@@ -1253,6 +1421,7 @@ async function openAccountModal() {
     $('acctLogout').style.display = 'none';
   }
   loadBackups();
+  renderVault();
 }
 async function loadBackups() {
   const r = await api('/api/account/backups');
@@ -1274,6 +1443,78 @@ async function loadBackups() {
     };
     row.appendChild(btn); wrap.appendChild(row);
   });
+}
+
+// ---- Account Vault: named, reusable per-worker logins ----
+function renderVault() {
+  const wrap = $('acctVault'); if (!wrap) return;
+  wrap.innerHTML = '';
+  const head = el('div'); head.style.cssText = 'display:flex;align-items:center;justify-content:space-between;margin-bottom:10px';
+  const h = el('div'); h.style.cssText = 'font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.12em';
+  h.textContent = 'Account Vault — reusable per-worker logins';
+  const add = el('button', 'icon-btn', '+ Add account'); add.onclick = () => openAccountEditor(null);
+  head.append(h, add); wrap.append(head);
+
+  const accts = S.accounts || [];
+  if (!accts.length) {
+    const e = el('div'); e.style.cssText = 'color:var(--muted);font-size:12px';
+    e.textContent = 'No saved accounts yet. Add one to run workers on different Claude logins in parallel.';
+    wrap.append(e); return;
+  }
+  accts.forEach((acc) => {
+    const row = el('div', 'vault-row');
+    const sw = el('div', 'v-swatch'); sw.style.background = acc.color || '#E8A33D'; row.append(sw);
+    const col = el('div'); col.style.cssText = 'display:flex;flex-direction:column;gap:3px';
+    col.append(el('div', 'v-name', acc.name));
+    const status = el('div', 'v-tok', 'checking login…'); col.append(status); row.append(col);
+    // Ask the server whether this account's config dir holds a valid login.
+    api('/api/account/status-dir?id=' + acc.id).then((r) => {
+      status.textContent = r && r.loggedIn ? ('✓ ' + (r.email || 'logged in')) : 'not logged in';
+      status.style.color = r && r.loggedIn ? 'var(--accent2)' : 'var(--muted)';
+    }).catch(() => { status.textContent = 'status unknown'; });
+    const act = el('div', 'v-actions');
+    const login = el('button', 'icon-btn', 'Log in'); login.title = 'Sign this account into its own isolated profile';
+    login.onclick = async () => {
+      await api('/api/account/login-dir', 'POST', { id: acc.id });
+      alert('A terminal opened for "' + acc.name + '".\n\nA browser will open — sign in / Authorize the account you want for this profile.\nWhen done, come back and click Re-check.');
+      login.textContent = 'Re-check';
+      login.onclick = () => renderVault();
+    };
+    const ed = el('button', 'icon-btn', 'Edit'); ed.onclick = () => openAccountEditor(acc);
+    const del = el('button', 'icon-btn', 'Delete');
+    del.onclick = async () => {
+      if (!confirm('Delete account "' + acc.name + '"? Workers using it fall back to the machine login.')) return;
+      await api('/api/accounts/' + acc.id, 'DELETE'); await refresh(); renderVault();
+    };
+    act.append(login, ed, del); row.append(act);
+    wrap.append(row);
+  });
+}
+function openAccountEditor(acc) {
+  const wrap = $('acctVault'); if (!wrap) return;
+  const iStyle = 'padding:8px 10px;background:var(--input);border:1px solid var(--line);border-radius:6px;color:var(--text);width:100%';
+  wrap.innerHTML = '';
+  const form = el('div', 'vault-row'); form.style.cssText = 'flex-direction:column;align-items:stretch;gap:8px';
+  form.innerHTML =
+      '<div style="font-weight:600">' + (acc ? 'Edit account' : 'New account') + '</div>'
+    + '<input id="vfName" placeholder="Name (e.g. Work, Personal, Barak)" style="' + iStyle + '" value="' + esc(acc ? acc.name : '') + '" />'
+    + '<div style="display:flex;gap:10px;align-items:center">'
+    +   '<label style="font-size:12px;color:var(--muted)">Colour</label>'
+    +   '<input id="vfColor" type="color" value="' + (acc && acc.color ? acc.color : '#E8A33D') + '" style="width:44px;height:30px;padding:0;border:0;background:none;cursor:pointer" />'
+    + '</div>'
+    + '<div style="font-size:11px;color:var(--muted)">After saving, click <b>Log in</b> on the account to sign it into its own isolated profile.</div>'
+    + '<div style="display:flex;gap:8px;justify-content:flex-end">'
+    +   '<button id="vfCancel" class="ghost" type="button">Cancel</button>'
+    +   '<button id="vfSave" class="icon-btn" type="button">Save</button>'
+    + '</div>';
+  wrap.append(form);
+  $('vfCancel').onclick = () => renderVault();
+  $('vfSave').onclick = async () => {
+    const name = $('vfName').value.trim(); if (!name) { alert('Name is required'); return; }
+    const body = { name, color: $('vfColor').value, provider: 'claude' };
+    if (acc) body.id = acc.id;
+    await api('/api/accounts', 'POST', body); await refresh(); renderVault();
+  };
 }
 
 // ---- CMD+K palette ----
@@ -1380,6 +1621,7 @@ document.querySelectorAll('#layoutBar button').forEach((b) => { b.onclick = () =
 $('npCreate').onclick = createProject;
 $('wmSave').onclick = saveWorker;
 $('wmEngine').onchange = syncEngineFields;
+$('loopStart').onclick = startLoop;
 $('tplNew').onclick = () => openTemplateEditor(null);
 $('teSave').onclick = saveTemplate;
 $('teAddRole').onclick = () => { editingTemplate.roles.push({ role: '', soul: '', model: '', reportsTo: '' }); renderTemplateRoles(); };

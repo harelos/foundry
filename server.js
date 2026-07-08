@@ -14,16 +14,35 @@ const PERMISSION_MODE = process.env.MC_PERMISSION_MODE || 'bypassPermissions';
 
 const DATA_FILE = path.join(__dirname, 'data.json');
 const TEMPLATES_FILE = path.join(__dirname, 'templates.json');
+// Each Vault account gets its own isolated Claude config dir here (Multi-Claude model).
+const ACCOUNTS_BASE = path.join(process.env.USERPROFILE || process.env.HOME || __dirname, '.foundry-accounts');
 
 // The Reel — mini-app router
 const reel = require('./reel');
 
 // ---------- State ----------
-let state = { projects: [], activeProjectId: null, nextNum: 1 };
+let state = { projects: [], activeProjectId: null, nextNum: 1, accounts: [] };
 let templates = [];
 const agents = new Map(); // id -> agent (runtime + persisted)
 
 function newTotals() { return { input: 0, output: 0, cache: 0, cost: 0, turns: 0, history: [] }; }
+// Autonomous loop state: the agent keeps running turn-after-turn until a cap is hit or the user stops it.
+function newLoop() { return { active: false, prompt: '', startedAt: 0, maxMs: 0, maxIterations: 0, maxCostUsd: 0, iterations: 0, startCost: 0, reason: '' }; }
+function agentCost(agent) {
+  const h = (agent.totals && agent.totals.history) || [];
+  return h.reduce((s, e) => s + (e.cost || 0), 0);
+}
+// Decide whether a looping agent should run another turn. Increments the iteration count
+// for the turn that just finished, then checks all four stop conditions.
+function loopTick(agent) {
+  const lp = agent.loop;
+  if (!lp || !lp.active) return { continue: false, reason: 'not looping' };
+  lp.iterations += 1;
+  if (lp.maxIterations && lp.iterations >= lp.maxIterations) { lp.active = false; lp.reason = `iteration cap (${lp.maxIterations})`; }
+  else if (lp.maxMs && (Date.now() - lp.startedAt) >= lp.maxMs) { lp.active = false; lp.reason = 'time limit'; }
+  else if (lp.maxCostUsd && (agentCost(agent) - lp.startCost) >= lp.maxCostUsd) { lp.active = false; lp.reason = `budget ($${lp.maxCostUsd})`; }
+  return lp.active ? { continue: true, prompt: lp.prompt } : { continue: false, reason: lp.reason };
+}
 
 // ---------- Persistence ----------
 function loadAll() {
@@ -33,11 +52,15 @@ function loadAll() {
       state.projects = d.projects || [];
       state.activeProjectId = d.activeProjectId || null;
       state.nextNum = d.nextNum || 1;
+      state.accounts = d.accounts || [];
       (d.agents || []).forEach((a) => {
         a.busy = false;
         a.totals = a.totals || newTotals();
         if (!a.totals.history) a.totals.history = a.totalsHistory || [];
         delete a.totalsHistory;
+        // Backward-compat + never resume a loop across a restart.
+        a.loop = a.loop || newLoop();
+        a.loop.active = false;
         agents.set(a.id, a);
       });
     }
@@ -65,16 +88,18 @@ function saveData() {
     projects: state.projects,
     activeProjectId: state.activeProjectId,
     nextNum: state.nextNum,
+    accounts: state.accounts,
     agents: [...agents.values()].map((a) => ({
       id: a.id, num: a.num, name: a.name, role: a.role, soul: a.soul,
       model: a.model, effort: a.effort, reportsTo: a.reportsTo, projectId: a.projectId,
       cwd: a.cwd, sessionId: a.sessionId, totals: a.totals, primedSoul: a.primedSoul,
+      accountId: a.accountId,
       engine: a.engine, apiBaseUrl: a.apiBaseUrl, apiKey: a.apiKey, apiModel: a.apiModel,
       ccBaseUrl: a.ccBaseUrl, ccAuthToken: a.ccAuthToken, ccModel: a.ccModel, ccOauthToken: a.ccOauthToken,
       ocModel: a.ocModel, ocApiKey: a.ocApiKey, ocProvider: a.ocProvider,
       codexModel: a.codexModel, codexApiKey: a.codexApiKey,
       hermesProvider: a.hermesProvider, hermesModel: a.hermesModel, hermesApiKey: a.hermesApiKey,
-      apiHistory: a.apiHistory || [],
+      loop: a.loop, apiHistory: a.apiHistory || [],
       totalsHistory: (a.totals && a.totals.history) || [],
     })),
   };
@@ -90,24 +115,28 @@ function saveTemplates() {
 
 // ---------- Helpers ----------
 function getProject(id) { return state.projects.find((p) => p.id === id); }
+function accountById(id) { return (state.accounts || []).find((a) => a.id === id); }
 function projectAgents(pid) { return [...agents.values()].filter((a) => a.projectId === pid); }
 
 function publicAgent(a) {
   return { id: a.id, num: a.num, name: a.name, role: a.role || '', soul: a.soul || '',
            model: a.model || '', effort: a.effort || '', reportsTo: a.reportsTo || '', projectId: a.projectId,
            cwd: a.cwd, busy: a.busy, hasSession: !!a.sessionId, totals: a.totals,
+           accountId: a.accountId || '',
            engine: a.engine || 'claude-code',
            apiBaseUrl: a.apiBaseUrl || '', apiKey: a.apiKey || '', apiModel: a.apiModel || '',
            ccBaseUrl: a.ccBaseUrl || '', ccAuthToken: a.ccAuthToken || '', ccModel: a.ccModel || '', ccOauthToken: a.ccOauthToken || '',
            ocModel: a.ocModel || '', ocApiKey: a.ocApiKey || '', ocProvider: a.ocProvider || '',
            codexModel: a.codexModel || '', codexApiKey: a.codexApiKey || '',
-           hermesProvider: a.hermesProvider || '', hermesModel: a.hermesModel || '', hermesApiKey: a.hermesApiKey || '' };
+           hermesProvider: a.hermesProvider || '', hermesModel: a.hermesModel || '', hermesApiKey: a.hermesApiKey || '',
+           loop: a.loop || newLoop() };
 }
 function publicState() {
   return {
     activeProjectId: state.activeProjectId,
     projects: state.projects,
     templates,
+    accounts: state.accounts,
     agents: [...agents.values()].map(publicAgent),
   };
 }
@@ -183,6 +212,7 @@ function createAgent(o) {
     id, num, name: o.name || o.role || `Agent #${num}`, role: o.role || '', soul: o.soul || '',
     model: o.model || '', reportsTo: o.reportsTo || '', projectId: o.projectId,
     cwd: o.cwd || (getProject(o.projectId) || {}).cwd || DEFAULT_CWD,
+    accountId: o.accountId || '',
     // Engine: 'claude-code' (full tools) or 'api' (direct OpenAI-compatible, chat only)
     engine: o.engine || 'claude-code', effort: o.effort || '',
     apiBaseUrl: o.apiBaseUrl || '', apiKey: o.apiKey || '', apiModel: o.apiModel || '',
@@ -190,6 +220,7 @@ function createAgent(o) {
     ocModel: o.ocModel || '', ocApiKey: o.ocApiKey || '', ocProvider: o.ocProvider || '',
     codexModel: o.codexModel || '', codexApiKey: o.codexApiKey || '',
     hermesProvider: o.hermesProvider || '', hermesModel: o.hermesModel || '', hermesApiKey: o.hermesApiKey || '',
+    loop: newLoop(),
     sessionId: null, busy: false, totals: newTotals(), primedSoul: false, pendingContext: null,
     apiHistory: [],
   };
@@ -223,78 +254,103 @@ function runTurn(agent, text, res) {
   agent.busy = true;
   res.writeHead(200, { 'Content-Type': 'application/x-ndjson; charset=utf-8', 'Cache-Control': 'no-cache' });
 
-  // Persona priming happens through stdin (no shell-quoting headaches).
-  let toSend = text;
-  if (!agent.primedSoul) {
-    const persona = buildPersona(agent);
-    if (persona) toSend = persona + '\n\n=== YOUR TASK ===\n' + text;
-    agent.primedSoul = true;
-  } else if (agent.pendingContext) {
-    toSend = agent.pendingContext + '\n\n' + text;
-  }
-  agent.pendingContext = null;
+  // Per-agent Claude account (resolved once). Preferred: a Vault account with its own
+  // isolated config dir (Multi-Claude model). Fallbacks: a raw OAuth token, then the
+  // machine login. Proxy settings still win if configured.
+  const acct = agent.accountId ? accountById(agent.accountId) : null;
+  const oauthToken = (acct && acct.provider === 'claude' && acct.token) ? acct.token : agent.ccOauthToken;
 
-  const model = agent.ccModel || agent.model;
-  const args = ['-p', '--output-format', 'stream-json', '--verbose', '--permission-mode', PERMISSION_MODE];
-  if (model) args.push('--model', model);
-  if (agent.effort) args.push('--effort', agent.effort);
-  if (agent.sessionId) args.push('--resume', agent.sessionId);
-
-  // Optional proxy: run Claude Code (with all its tools) on a non-Anthropic model.
   const env = { ...process.env };
   if (agent.ccBaseUrl) env.ANTHROPIC_BASE_URL = agent.ccBaseUrl;
   if (agent.ccAuthToken) { env.ANTHROPIC_AUTH_TOKEN = agent.ccAuthToken; env.ANTHROPIC_API_KEY = agent.ccAuthToken; }
-  // Per-agent Claude account: a long-lived OAuth token from `claude setup-token`.
-  // Runs this agent on a DIFFERENT Claude subscription than the machine login,
-  // fully isolated, without touching ~/.claude/.credentials.json. Ignored if the
-  // proxy above is in use. We clear any inherited key so the token wins.
-  else if (agent.ccOauthToken) {
-    env.CLAUDE_CODE_OAUTH_TOKEN = agent.ccOauthToken;
+  else if (acct && acct.configDir) {
+    // Isolated login (Multi-Claude model): this worker reads its own credentials
+    // from the account's dedicated config dir, leaving the machine's main login
+    // untouched — so two Max accounts can run in parallel.
+    env.CLAUDE_CONFIG_DIR = acct.configDir;
+    delete env.ANTHROPIC_API_KEY;
+    delete env.ANTHROPIC_AUTH_TOKEN;
+  }
+  else if (oauthToken) {
+    env.CLAUDE_CODE_OAUTH_TOKEN = oauthToken;   // clear inherited key so the token wins
     delete env.ANTHROPIC_API_KEY;
     delete env.ANTHROPIC_AUTH_TOKEN;
   }
 
-  let child;
-  try { child = spawn('claude', args, { cwd: agent.cwd, shell: true, env }); }
-  catch (e) { send(res, { type: 'error', error: String(e) }); agent.busy = false; return res.end(); }
+  const model = agent.ccModel || agent.model;
 
-  agent.child = child;
-  agent.stopped = false;
-  child.stdin.write(toSend);
-  child.stdin.end();
-
-  let buf = '';
-  child.stdout.on('data', (chunk) => {
-    buf += chunk.toString();
-    let idx;
-    while ((idx = buf.indexOf('\n')) >= 0) {
-      const line = buf.slice(0, idx).trim();
-      buf = buf.slice(idx + 1);
-      if (!line) continue;
-      let evt; try { evt = JSON.parse(line); } catch { continue; }
-      handleEvent(agent, evt, res);
+  const launch = (isRetry) => {
+    // Persona priming happens through stdin (no shell-quoting headaches).
+    let toSend = text;
+    if (!agent.primedSoul) {
+      const persona = buildPersona(agent);
+      if (persona) toSend = persona + '\n\n=== YOUR TASK ===\n' + text;
+      agent.primedSoul = true;
+    } else if (agent.pendingContext) {
+      toSend = agent.pendingContext + '\n\n' + text;
     }
-  });
+    agent.pendingContext = null;
 
-  let stderr = '';
-  child.stderr.on('data', (c) => (stderr += c.toString()));
+    const args = ['-p', '--output-format', 'stream-json', '--verbose', '--permission-mode', PERMISSION_MODE];
+    if (model) args.push('--model', model);
+    if (agent.effort) args.push('--effort', agent.effort);
+    const resuming = !!agent.sessionId;
+    if (resuming) args.push('--resume', agent.sessionId);
 
-  child.on('close', (code) => {
-    if (buf.trim()) { try { handleEvent(agent, JSON.parse(buf.trim()), res); } catch {} }
-    agent.child = null;
-    if (agent.stopped) { send(res, { type: 'system', stopped: true }); agent.stopped = false; }
-    else if (code) send(res, { type: 'error', error: stderr.trim() || `claude exited with code ${code}` });
-    agent.busy = false;
-    saveData();
-    send(res, { type: 'done' });
-    res.end();
-  });
+    let child;
+    try { child = spawn('claude', args, { cwd: agent.cwd, shell: true, env }); }
+    catch (e) { send(res, { type: 'error', error: String(e) }); agent.busy = false; return res.end(); }
 
-  child.on('error', (err) => {
-    send(res, { type: 'error', error: 'Failed to start claude: ' + err.message });
-    agent.busy = false;
-    res.end();
-  });
+    agent.child = child;
+    agent.stopped = false;
+    child.stdin.write(toSend);
+    child.stdin.end();
+
+    let buf = '';
+    child.stdout.on('data', (chunk) => {
+      buf += chunk.toString();
+      let idx;
+      while ((idx = buf.indexOf('\n')) >= 0) {
+        const line = buf.slice(0, idx).trim();
+        buf = buf.slice(idx + 1);
+        if (!line) continue;
+        let evt; try { evt = JSON.parse(line); } catch { continue; }
+        handleEvent(agent, evt, res);
+      }
+    });
+
+    let stderr = '';
+    child.stderr.on('data', (c) => (stderr += c.toString()));
+
+    child.on('close', (code) => {
+      if (buf.trim()) { try { handleEvent(agent, JSON.parse(buf.trim()), res); } catch {} }
+      agent.child = null;
+      if (agent.stopped) { send(res, { type: 'system', stopped: true }); agent.stopped = false; }
+      else if (code) {
+        const errText = stderr.trim() || `claude exited with code ${code}`;
+        // A resume against a session that doesn't exist in THIS account's profile
+        // (e.g. the worker's account was just switched) — drop it and start fresh once.
+        if (resuming && !isRetry && /no conversation found|session id|session not found/i.test(errText)) {
+          agent.sessionId = null;
+          agent.primedSoul = false;
+          return launch(true);
+        }
+        send(res, { type: 'error', error: errText });
+      }
+      agent.busy = false;
+      saveData();
+      send(res, { type: 'done' });
+      res.end();
+    });
+
+    child.on('error', (err) => {
+      send(res, { type: 'error', error: 'Failed to start claude: ' + err.message });
+      agent.busy = false;
+      res.end();
+    });
+  };
+
+  launch(false);
 }
 
 function handleEvent(agent, evt, res) {
@@ -792,16 +848,103 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // Open a terminal window running `claude setup-token`. The user completes the
-  // browser OAuth for whichever account they want, then copies the printed token
-  // into a Worker's "Claude account token" field. This does NOT touch the machine
-  // login — the token is used per-agent via CLAUDE_CODE_OAUTH_TOKEN.
+  // Run `claude setup-token`, which opens the browser for the user to Authorize the
+  // account they want, then prints a long-lived OAuth token (sk-ant-oat…) to stdout.
+  // We capture that token and return it so the app drops it straight into the Vault
+  // field — no terminal hunting. This does NOT touch the machine login; the token is
+  // used per-agent via CLAUDE_CODE_OAUTH_TOKEN. The request blocks (up to 3 min) while
+  // the user completes the browser step.
   if (pathname === '/api/account/setup-token' && method === 'POST') {
     try {
-      spawn('start "" cmd /k claude setup-token', [], { shell: true, detached: true });
+      const child = spawn('claude', ['setup-token'], { shell: true });
+      let out = '';
+      const grab = (d) => { out += d.toString(); };
+      child.stdout.on('data', grab);
+      child.stderr.on('data', grab);
+      let done = false;
+      const finish = (extra) => {
+        if (done) return; done = true;
+        const token = (out.match(/sk-ant-oat[A-Za-z0-9_-]+/) || [])[0] || '';
+        const url = (out.match(/https?:\/\/[^\s'"]+/) || [])[0] || '';
+        json(res, 200, { ok: !!token, token, url, output: out.slice(-2000), ...(extra || {}) });
+      };
+      const timer = setTimeout(() => { try { child.kill(); } catch {} finish({ timedOut: true }); }, 180000);
+      child.on('close', () => { clearTimeout(timer); finish(); });
+      child.on('error', (e) => { clearTimeout(timer); finish({ error: e.message }); });
+    } catch (e) { json(res, 500, { ok: false, error: e.message }); }
+    return;
+  }
+
+  // ---- Account Vault: named, reusable Claude accounts (one token, many workers) ----
+  if (pathname === '/api/accounts' && method === 'POST') {
+    const b = await readBody(req);
+    const name = (b.name || '').trim();
+    if (!name) return json(res, 400, { error: 'Name required' });
+    let acct;
+    if (b.id && (acct = accountById(b.id))) {
+      acct.name = name;
+      if (b.color != null) acct.color = b.color;
+      if (b.provider != null) acct.provider = b.provider;
+      if (b.token != null && b.token !== '') acct.token = b.token; // keep old token if blank on edit
+    } else {
+      const id = randomUUID().slice(0, 8);
+      const configDir = path.join(ACCOUNTS_BASE, id);
+      try { fs.mkdirSync(configDir, { recursive: true }); } catch {}
+      acct = { id, name, color: b.color || '#E8A33D', provider: b.provider || 'claude', token: b.token || '', configDir };
+      state.accounts.push(acct);
+    }
+    saveData();
+    return json(res, 200, acct);
+  }
+
+  // Open a terminal that logs this account into its OWN config dir (isolated login,
+  // does not touch the machine's main Claude login). The user completes the browser
+  // OAuth; credentials land in <configDir>\.credentials.json.
+  if (pathname === '/api/account/login-dir' && method === 'POST') {
+    const b = await readBody(req);
+    const acct = accountById(b.id);
+    if (!acct || !acct.configDir) return json(res, 404, { ok: false, error: 'Account not found' });
+    try { fs.mkdirSync(acct.configDir, { recursive: true }); } catch {}
+    try {
+      const flag = acct.provider === 'console' ? '--console' : '--claudeai';
+      spawn('start "" cmd /k set "CLAUDE_CONFIG_DIR=' + acct.configDir + '" ^& claude auth login ' + flag, [], { shell: true, detached: true });
       json(res, 200, { ok: true });
     } catch (e) { json(res, 500, { ok: false, error: e.message }); }
     return;
+  }
+
+  // Report whether an account's config dir holds a valid login (via `claude auth status`).
+  if (pathname === '/api/account/status-dir' && method === 'GET') {
+    const acct = accountById(new URL(req.url, 'http://localhost').searchParams.get('id'));
+    if (!acct || !acct.configDir) return json(res, 404, { loggedIn: false, error: 'Account not found' });
+    try {
+      const env = { ...process.env, CLAUDE_CONFIG_DIR: acct.configDir };
+      const child = spawn('claude', ['auth', 'status', '--json'], { shell: true, env });
+      let out = '';
+      child.stdout.on('data', (d) => out += d.toString());
+      child.stderr.on('data', (d) => out += d.toString());
+      let done = false;
+      const finish = () => {
+        if (done) return; done = true;
+        let email = '', loggedIn = false;
+        try { const j = JSON.parse((out.match(/\{[\s\S]*\}/) || ['{}'])[0]); loggedIn = !!(j.loggedIn ?? j.authenticated ?? j.email); email = j.email || (j.account && j.account.email) || ''; } catch {}
+        // fallback: read the credentials file directly
+        if (!email) { try { const c = JSON.parse(fs.readFileSync(path.join(acct.configDir, '.credentials.json'), 'utf8')); email = (c.claudeAiOauth && c.claudeAiOauth.email) || ''; loggedIn = loggedIn || !!email; } catch {} }
+        json(res, 200, { loggedIn, email });
+      };
+      const timer = setTimeout(() => { try { child.kill(); } catch {} finish(); }, 12000);
+      child.on('close', () => { clearTimeout(timer); finish(); });
+      child.on('error', () => { clearTimeout(timer); finish(); });
+    } catch (e) { json(res, 500, { loggedIn: false, error: e.message }); }
+    return;
+  }
+  const acctDel = pathname.match(/^\/api\/accounts\/([^/]+)$/);
+  if (acctDel && method === 'DELETE') {
+    state.accounts = state.accounts.filter((a) => a.id !== acctDel[1]);
+    // Unlink any agents that referenced it so they fall back to the machine login.
+    for (const a of agents.values()) if (a.accountId === acctDel[1]) a.accountId = '';
+    saveData();
+    return json(res, 200, { ok: true });
   }
 
   if (pathname === '/api/account/backups' && method === 'GET') {
@@ -893,12 +1036,42 @@ const server = http.createServer(async (req, res) => {
     saveData();
     return json(res, 200, publicState());
   }
-  if ((m = pathname.match(/^\/api\/agents\/([^/]+)(\/message|\/model|\/upload|\/edit|\/stop|\/save)?$/))) {
+  if ((m = pathname.match(/^\/api\/agents\/([^/]+)(\/message|\/model|\/upload|\/edit|\/stop|\/save|\/loop)?$/))) {
     const agent = agents.get(m[1]);
     if (method === 'DELETE') { agents.delete(m[1]); saveData(); return json(res, 200, publicState()); }
     if (!agent) return json(res, 404, { error: 'no such agent' });
 
-    if (m[2] === '/stop' && method === 'POST') { stopAgent(agent); return json(res, 200, { ok: true }); }
+    if (m[2] === '/stop' && method === 'POST') {
+      if (agent.loop && agent.loop.active) { agent.loop.active = false; agent.loop.reason = 'stopped by you'; }
+      stopAgent(agent); return json(res, 200, { ok: true });
+    }
+    if (m[2] === '/loop' && method === 'POST') {
+      const b = await readBody(req);
+      if (b.action === 'start') {
+        const prompt = (b.prompt || '').trim();
+        if (!prompt) return json(res, 400, { error: 'A recurring instruction is required to start a loop.' });
+        agent.loop = {
+          active: true, prompt,
+          startedAt: Date.now(),
+          maxMs: Math.max(0, Number(b.maxMinutes) || 0) * 60000,
+          maxIterations: Math.max(0, Number(b.maxIterations) || 0),
+          maxCostUsd: Math.max(0, Number(b.maxCostUsd) || 0),
+          iterations: 0, startCost: agentCost(agent), reason: '',
+        };
+        saveData();
+        return json(res, 200, { ok: true, loop: agent.loop });
+      }
+      if (b.action === 'stop') {
+        if (agent.loop) { agent.loop.active = false; agent.loop.reason = 'stopped by you'; }
+        stopAgent(agent); saveData();
+        return json(res, 200, { ok: true, loop: agent.loop || newLoop() });
+      }
+      if (b.action === 'tick') {
+        const r = loopTick(agent); saveData();
+        return json(res, 200, { ...r, loop: agent.loop });
+      }
+      return json(res, 400, { error: 'unknown loop action' });
+    }
     if (m[2] === '/message' && method === 'POST') {
       const b = await readBody(req);
       const text = (b.text || '').trim();
@@ -911,6 +1084,11 @@ const server = http.createServer(async (req, res) => {
       if (b.name != null) agent.name = b.name;
       if (b.role != null) agent.role = b.role;
       if (b.reportsTo != null) agent.reportsTo = b.reportsTo;
+      if (b.accountId != null && b.accountId !== agent.accountId) {
+        // Switching account = different login/profile. The old session lives in the
+        // old profile and can't be resumed here, so drop it and re-prime fresh.
+        agent.accountId = b.accountId; agent.sessionId = null; agent.primedSoul = false;
+      }
       if (b.soul != null && b.soul !== agent.soul) { agent.soul = b.soul; agent.primedSoul = false; }
       if (b.effort != null) agent.effort = b.effort;
       if (b.engine != null) agent.engine = b.engine;
