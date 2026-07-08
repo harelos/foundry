@@ -11,6 +11,7 @@
     formulas: [],
     accounts: [],
     activeAccountId: '',
+    reelLoop: { active: false, runs: 0, maxRuns: 0, reason: '' },
     settingsSet: { anthropic: false, higgsKeyId: false, higgsKeySecret: false, publicBaseUrl: '' },
     publishing: false,
     view: 'home',              // home | briefEditor | brief | generator | result | settings
@@ -75,6 +76,7 @@
       state.formulas = s.formulas || [];
       state.accounts = s.accounts || [];
       state.activeAccountId = s.activeAccountId || '';
+      state.reelLoop = s.reelLoop || { active: false, runs: 0, maxRuns: 0, reason: '' };
       state.settingsSet = s.settingsSet || {};
     } catch (e) { state.lastError = e.message; }
   }
@@ -337,6 +339,22 @@
 
   function renderMain() {
     const main = h('div', { class: 'reel-main' });
+    if (state.reelLoop && state.reelLoop.active) {
+      main.append(h('div', {
+        style: { display: 'flex', alignItems: 'center', gap: '12px', background: 'var(--accent2-soft)', border: '1px solid var(--accent2)', borderRadius: '10px', padding: '12px 16px', marginBottom: '20px' }
+      },
+        h('span', { class: 'mini-spinner', style: { borderTopColor: 'var(--accent2)' } }),
+        h('div', { style: { flex: 1 } },
+          h('div', { style: { fontWeight: 600, color: 'var(--accent2)' } }, '🔁 Auto-pilot running'),
+          h('div', { style: { fontSize: '12px', color: 'var(--muted)', fontFamily: 'var(--font-mono)' } },
+            (state.reelLoop.runs || 0) + (state.reelLoop.maxRuns ? '/' + state.reelLoop.maxRuns : '') + ' carousels generated')
+        ),
+        h('button', {
+          class: 'reel-btn danger small',
+          onclick: async () => { try { await api('/loop', { method: 'POST', body: { action: 'stop' } }); await refresh(); render(container); } catch (e) { state.lastError = e.message; render(container); } }
+        }, '■ Stop auto-pilot')
+      ));
+    }
     if (state.view === 'briefEditor') return renderBriefEditor(main);
     if (state.view === 'brief') return renderBriefDetail(main);
     if (state.view === 'generator') return renderGenerator(main);
@@ -731,6 +749,39 @@
     );
     form.append(actions);
     main.append(form);
+
+    // Auto-pilot: same options, but generate on repeat until a cap or Stop
+    const runsIn = h('input', { type: 'number', min: '1', step: '1', placeholder: 'e.g. 10', style: { width: '100%' } });
+    const minsIn = h('input', { type: 'number', min: '0', step: '1', placeholder: 'optional', style: { width: '100%' } });
+    const autoPanel = h('div', { style: { marginTop: '28px', paddingTop: '20px', borderTop: '1px solid var(--line)', maxWidth: '640px' } },
+      h('h3', { class: 'reel-section-title' }, '🔁 Auto-pilot'),
+      h('div', { class: 'reel-subtitle', style: { marginBottom: '14px' } }, 'keep generating carousels with these settings on repeat, hands-off, until a cap or you stop.'),
+      h('div', { class: 'reel-gen-form' },
+        h('div', { class: 'reel-field' }, h('label', {}, 'How many carousels'), runsIn),
+        h('div', { class: 'reel-field' }, h('label', {}, 'Or stop after (minutes)'), minsIn)
+      ),
+      h('button', {
+        class: 'reel-btn primary',
+        style: { marginTop: '6px' },
+        onclick: async () => {
+          const body = {
+            action: 'start', briefId: b.id,
+            hookStyle: controls.hookStyle(), format: controls.format(), formula: controls.formula(),
+            slideCount: parseInt(controls.slideCount(), 10),
+            language: controls.language() || (b.language || 'English'),
+            aspectRatio: controls.aspectRatio(),
+            includeImages: controls.includeImages() === 'yes',
+            maxRuns: parseInt(runsIn.value, 10) || 0,
+            maxMinutes: parseFloat(minsIn.value) || 0,
+          };
+          if (!body.maxRuns && !body.maxMinutes) { state.lastError = 'Set a carousel count or a time limit for auto-pilot.'; render(container); return; }
+          try { await api('/loop', { method: 'POST', body }); await refresh(); state.view = 'brief'; render(container); }
+          catch (e) { state.lastError = e.message; render(container); }
+        }
+      }, 'Start auto-pilot'),
+      h('div', { class: 'hint', style: { marginTop: '8px' } }, 'Runs on the server, so it keeps going even if you close this view. Watch the banner up top for progress.')
+    );
+    main.append(autoPanel);
     return main;
   }
 
@@ -1075,7 +1126,18 @@
     pubInput.value = state.settingsSet.publicBaseUrl || '';
     pubField.append(pubInput, h('div', { class: 'hint' }, 'TikTok fetches slide images from public URLs, so a localhost server is not reachable. Point this at a tunnel (ngrok, cloudflared) forwarding to this server. Leave blank if you only export manually.'));
 
-    form.append(a.field, k.field, s.field, pubField);
+    // TikTok app credentials (for the Connect-with-TikTok OAuth flow)
+    const tkKey = mkKeyField('tiktokClientKey', 'TikTok Client Key', 'From developers.tiktok.com → your app. Needed for the "Connect TikTok" button.', state.settingsSet.tiktokClientKey);
+    const tkSecret = mkKeyField('tiktokClientSecret', 'TikTok Client Secret', 'From the same app. Stored server-side, never sent back to the browser.', state.settingsSet.tiktokClientSecret);
+    const redirectUri = state.settingsSet.tiktokRedirectUri || (location.origin + '/api/reel/tiktok/callback');
+    const redirField = h('div', { class: 'reel-field' });
+    redirField.append(
+      h('label', {}, 'Redirect URI to register in your TikTok app'),
+      h('input', { type: 'text', value: redirectUri, readonly: true, onclick: (e) => e.target.select() }),
+      h('div', { class: 'hint' }, 'Copy this EXACT URL into your TikTok app\'s "Login Kit → Redirect URI" list, or it will reject the connection.')
+    );
+
+    form.append(a.field, k.field, s.field, pubField, tkKey.field, tkSecret.field, redirField);
 
     if (state.lastError) form.append(h('div', { class: 'reel-error' }, state.lastError));
 
@@ -1088,6 +1150,8 @@
           if (a.input.value) body.anthropicKey = a.input.value;
           if (k.input.value) body.higgsKeyId = k.input.value;
           if (s.input.value) body.higgsKeySecret = s.input.value;
+          if (tkKey.input.value) body.tiktokClientKey = tkKey.input.value;
+          if (tkSecret.input.value) body.tiktokClientSecret = tkSecret.input.value;
           body.publicBaseUrl = pubInput.value.trim();
           try { await api('/settings', { method: 'POST', body }); await refresh(); render(container); }
           catch (e) { state.lastError = e.message; render(container); }
@@ -1137,25 +1201,44 @@
       wrap.append(h('div', { class: 'reel-empty', style: { padding: '20px' } }, h('p', {}, 'No accounts yet. Add your first TikTok account below.')));
     }
 
-    // Add-account mini form
+    // Primary path: one-click OAuth connect
+    const connectBox = h('div', { class: 'reel-info-cell', style: { padding: '16px 18px', marginBottom: '10px' } });
+    if (state.settingsSet.tiktokReady) {
+      connectBox.append(
+        h('button', {
+          class: 'reel-btn primary',
+          onclick: () => { window.location.href = '/api/reel/tiktok/connect'; }
+        }, '＋ Connect TikTok account'),
+        h('div', { class: 'hint', style: { marginTop: '8px' } }, 'Opens TikTok, you approve the permissions, and you come right back — no token to copy. Repeat for each of your accounts (log into the one you want on tiktok.com first).')
+      );
+    } else {
+      connectBox.append(
+        h('div', { style: { color: 'var(--muted)', fontSize: '13px' } }, 'To enable one-click connect, add your TikTok Client Key + Secret in the settings above and Save. Then a "Connect TikTok account" button appears here.')
+      );
+    }
+    wrap.append(connectBox);
+
+    // Fallback: add manually with a token
     const labelIn = h('input', { type: 'text', placeholder: 'Account label (e.g. "Dopamodoro main")' });
-    const tokenIn = h('input', { type: 'text', placeholder: 'TikTok access token (from your TikTok developer app OAuth)' });
+    const tokenIn = h('input', { type: 'text', placeholder: 'TikTok access token' });
     const openIn = h('input', { type: 'text', placeholder: 'open_id (optional)' });
     [labelIn, tokenIn, openIn].forEach((i) => { i.style.cssText = 'width:100%;background:var(--input);border:1px solid var(--line);border-radius:8px;color:var(--text);padding:10px 12px;margin-bottom:8px;font:14px var(--font-body);'; });
-    const addBox = h('div', { class: 'reel-info-cell', style: { padding: '16px 18px' } },
-      h('h4', { style: { margin: '0 0 10px', fontSize: '11px', letterSpacing: '0.5px', textTransform: 'uppercase', color: 'var(--muted)', fontFamily: 'var(--font-mono)' } }, '+ Add TikTok account'),
-      labelIn, tokenIn, openIn,
-      h('button', {
-        class: 'reel-btn primary small',
-        onclick: async () => {
-          if (!labelIn.value.trim()) { labelIn.focus(); return; }
-          try { await api('/account', { method: 'POST', body: { label: labelIn.value.trim(), platform: 'tiktok', accessToken: tokenIn.value.trim(), openId: openIn.value.trim() } }); await refresh(); render(container); }
-          catch (e) { state.lastError = e.message; render(container); }
-        }
-      }, 'Add account'),
-      h('div', { class: 'hint', style: { marginTop: '8px' } }, 'Get a token from your registered TikTok developer app (Content Posting API scope). Direct public posting needs an audited app; unaudited apps post to your TikTok inbox as a draft.')
+    const details = h('details', { style: { marginTop: '4px' } },
+      h('summary', { style: { cursor: 'pointer', color: 'var(--muted)', fontSize: '12px', fontFamily: 'var(--font-mono)' } }, 'Advanced: add manually with a token'),
+      h('div', { class: 'reel-info-cell', style: { padding: '16px 18px', marginTop: '8px' } },
+        labelIn, tokenIn, openIn,
+        h('button', {
+          class: 'reel-btn small',
+          onclick: async () => {
+            if (!labelIn.value.trim()) { labelIn.focus(); return; }
+            try { await api('/account', { method: 'POST', body: { label: labelIn.value.trim(), platform: 'tiktok', accessToken: tokenIn.value.trim(), openId: openIn.value.trim() } }); await refresh(); render(container); }
+            catch (e) { state.lastError = e.message; render(container); }
+          }
+        }, 'Add account'),
+        h('div', { class: 'hint', style: { marginTop: '8px' } }, 'Manually-added tokens can\'t auto-refresh. Prefer Connect above.')
+      )
     );
-    wrap.append(addBox);
+    wrap.append(details);
     return wrap;
   }
 

@@ -15,8 +15,12 @@ let db = {
   briefs: [], posts: [],
   accounts: [],            // [{ id, label, platform, accessToken, openId, addedAt }]
   activeAccountId: '',
-  settings: { anthropicKey: '', higgsKeyId: '', higgsKeySecret: '', publicBaseUrl: '' },
+  reelLoop: { active: false, briefId: '', runs: 0, maxRuns: 0, maxMs: 0, startedAt: 0, opts: {}, reason: '', lastPostId: '' },
+  settings: { anthropicKey: '', higgsKeyId: '', higgsKeySecret: '', publicBaseUrl: '', tiktokClientKey: '', tiktokClientSecret: '', tiktokRedirectUri: '' },
 };
+
+// Transient CSRF state for the TikTok OAuth handshake (not persisted).
+const oauthStates = new Map();
 
 function load() {
   try {
@@ -27,6 +31,8 @@ function load() {
       db.accounts = d.accounts || [];
       db.activeAccountId = d.activeAccountId || '';
       db.settings = { ...db.settings, ...(d.settings || {}) };
+      // Never resume an auto-generate loop across a restart.
+      db.reelLoop = { ...db.reelLoop, ...(d.reelLoop || {}), active: false };
     }
   } catch (e) { console.log('  (reel: could not load reel-data.json:', e.message, ')'); }
 }
@@ -286,13 +292,70 @@ function findBrief(id) { return db.briefs.find((b) => b.id === id); }
 function findPost(id) { return db.posts.find((p) => p.id === id); }
 function findAccount(id) { return db.accounts.find((a) => a.id === id); }
 
+// ---------- TikTok OAuth (Login Kit) ----------
+function tiktokRedirectUri(req) {
+  if (db.settings.tiktokRedirectUri) return db.settings.tiktokRedirectUri.trim();
+  const proto = (req.headers['x-forwarded-proto'] || 'http').split(',')[0].trim();
+  return `${proto}://${req.headers.host}/api/reel/tiktok/callback`;
+}
+function tiktokAuthUrl(req, state) {
+  const p = new URLSearchParams({
+    client_key: db.settings.tiktokClientKey.trim(),
+    scope: 'user.info.basic,video.upload,video.publish',
+    response_type: 'code',
+    redirect_uri: tiktokRedirectUri(req),
+    state,
+  });
+  return 'https://www.tiktok.com/v2/auth/authorize/?' + p.toString();
+}
+async function tiktokTokenRequest(form) {
+  const body = new URLSearchParams(form).toString();
+  const r = await httpsRequest('https://open.tiktokapis.com/v2/oauth/token/', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Content-Length': Buffer.byteLength(body) },
+  }, body);
+  const data = JSON.parse(r.body.toString());
+  if (data.error) throw new Error(`TikTok OAuth: ${data.error_description || data.error}`);
+  return data;
+}
+function tiktokExchangeCode(req, code) {
+  return tiktokTokenRequest({
+    client_key: db.settings.tiktokClientKey.trim(),
+    client_secret: db.settings.tiktokClientSecret.trim(),
+    code, grant_type: 'authorization_code',
+    redirect_uri: tiktokRedirectUri(req),
+  });
+}
+async function tiktokUserInfo(accessToken) {
+  const r = await httpsRequest('https://open.tiktokapis.com/v2/user/info/?fields=open_id,display_name', {
+    method: 'GET', headers: { 'Authorization': 'Bearer ' + accessToken },
+  });
+  try { return JSON.parse(r.body.toString()).data.user; } catch { return {}; }
+}
+// Refresh an account's access token if it's expired (or about to be), in place.
+async function tiktokEnsureFresh(account) {
+  if (!account.expiresAt || Date.now() < account.expiresAt - 60000) return;
+  if (!account.refreshToken) return; // manual-token accounts can't refresh
+  const t = await tiktokTokenRequest({
+    client_key: db.settings.tiktokClientKey.trim(),
+    client_secret: db.settings.tiktokClientSecret.trim(),
+    grant_type: 'refresh_token', refresh_token: account.refreshToken,
+  });
+  account.accessToken = t.access_token;
+  account.refreshToken = t.refresh_token || account.refreshToken;
+  account.expiresAt = Date.now() + (t.expires_in || 86400) * 1000;
+  save();
+}
+
 // Publish a carousel's slides to TikTok via the official Content Posting API (photo mode).
 // TikTok PULLS the images from public URLs, so slide assets must be reachable from the
 // internet — set settings.publicBaseUrl to a tunnel (e.g. ngrok) pointing at this server.
 // Unaudited dev apps can only send to the TikTok inbox as a draft (post_mode MEDIA_UPLOAD,
 // privacy SELF_ONLY); DIRECT_POST needs an audited app. Defaults are chosen accordingly.
 async function tiktokPublish(account, post, opts = {}) {
-  if (!account || !account.accessToken) throw new Error('This TikTok account has no access token. Add one in Accounts.');
+  if (!account) throw new Error('No TikTok account selected.');
+  try { await tiktokEnsureFresh(account); } catch (e) { throw new Error('TikTok token refresh failed (reconnect the account): ' + e.message); }
+  if (!account.accessToken) throw new Error('This TikTok account is not connected. Connect it in Accounts.');
   const base = (db.settings.publicBaseUrl || '').trim().replace(/\/$/, '');
   if (!base) throw new Error('TikTok pulls images from public URLs. Set a Public base URL (a tunnel like ngrok pointing at this server) in Settings first.');
   if (/localhost|127\.0\.0\.1/.test(base)) throw new Error('Public base URL cannot be localhost — TikTok\'s servers must be able to reach it. Use a public tunnel URL.');
@@ -404,6 +467,30 @@ async function generateCarousel(briefId, opts) {
   return post;
 }
 
+// Auto-generate loop: keep producing carousels for a brief on repeat (detached from any
+// request, so it runs even after you navigate away) until run cap / time limit / stop.
+async function runReelLoop() {
+  const lp = db.reelLoop;
+  while (lp.active) {
+    if (lp.maxRuns && lp.runs >= lp.maxRuns) { lp.active = false; lp.reason = `run cap (${lp.maxRuns})`; break; }
+    if (lp.maxMs && (Date.now() - lp.startedAt) >= lp.maxMs) { lp.active = false; lp.reason = 'time limit'; break; }
+    try {
+      const post = await generateCarousel(lp.briefId, lp.opts || {});
+      lp.runs += 1;
+      lp.lastPostId = post.id;
+      save();
+    } catch (e) {
+      lp.active = false;
+      lp.reason = 'error: ' + (e.message || e).slice(0, 160);
+      save();
+      break;
+    }
+    if (!lp.active) break;
+    await new Promise((r) => setTimeout(r, 4000)); // small breather between carousels
+  }
+  save();
+}
+
 // ---------- Static asset serving ----------
 function serveAsset(res, relPath) {
   const clean = path.normalize(relPath).replace(/^([\\/])+/, '');
@@ -435,11 +522,16 @@ async function route(pathname, method, req, res, helpers) {
       })),
       accounts: db.accounts.map((a) => ({ id: a.id, label: a.label, platform: a.platform || 'tiktok', hasToken: !!a.accessToken })),
       activeAccountId: db.activeAccountId,
+      reelLoop: { active: db.reelLoop.active, briefId: db.reelLoop.briefId, runs: db.reelLoop.runs, maxRuns: db.reelLoop.maxRuns, reason: db.reelLoop.reason },
       settingsSet: {
         anthropic: !!db.settings.anthropicKey,
         higgsKeyId: !!db.settings.higgsKeyId,
         higgsKeySecret: !!db.settings.higgsKeySecret,
         publicBaseUrl: db.settings.publicBaseUrl || '',
+        tiktokClientKey: !!db.settings.tiktokClientKey,
+        tiktokClientSecret: !!db.settings.tiktokClientSecret,
+        tiktokReady: !!(db.settings.tiktokClientKey && db.settings.tiktokClientSecret),
+        tiktokRedirectUri: db.settings.tiktokRedirectUri || '',
       },
     });
   }
@@ -451,6 +543,9 @@ async function route(pathname, method, req, res, helpers) {
     if (b.higgsKeyId !== undefined) db.settings.higgsKeyId = String(b.higgsKeyId || '').trim();
     if (b.higgsKeySecret !== undefined) db.settings.higgsKeySecret = String(b.higgsKeySecret || '').trim();
     if (b.publicBaseUrl !== undefined) db.settings.publicBaseUrl = String(b.publicBaseUrl || '').trim();
+    if (b.tiktokClientKey !== undefined) db.settings.tiktokClientKey = String(b.tiktokClientKey || '').trim();
+    if (b.tiktokClientSecret !== undefined) db.settings.tiktokClientSecret = String(b.tiktokClientSecret || '').trim();
+    if (b.tiktokRedirectUri !== undefined) db.settings.tiktokRedirectUri = String(b.tiktokRedirectUri || '').trim();
     save();
     return json(res, 200, { ok: true });
   }
@@ -497,6 +592,48 @@ async function route(pathname, method, req, res, helpers) {
     db.activeAccountId = b.id || '';
     save();
     return json(res, 200, { ok: true, activeAccountId: db.activeAccountId });
+  }
+
+  // ---- TikTok OAuth (Login Kit): click Connect → approve on TikTok → back here ----
+  if (pathname === '/api/reel/tiktok/connect' && method === 'GET') {
+    if (!db.settings.tiktokClientKey || !db.settings.tiktokClientSecret) {
+      res.writeHead(400, { 'Content-Type': 'text/html; charset=utf-8' });
+      return res.end('<p>Set your TikTok Client Key and Secret in The Reel → Settings first, then try Connect again.</p>');
+    }
+    const st = randomUUID();
+    oauthStates.set(st, Date.now());
+    // prune stale states (>10 min)
+    for (const [k, t] of oauthStates) if (Date.now() - t > 600000) oauthStates.delete(k);
+    res.writeHead(302, { Location: tiktokAuthUrl(req, st) });
+    return res.end();
+  }
+  if (pathname === '/api/reel/tiktok/callback' && method === 'GET') {
+    const q = new URL(req.url, 'http://x').searchParams;
+    const code = q.get('code'), st = q.get('state'), err = q.get('error');
+    const backHtml = (title, msg) => `<!doctype html><meta charset="utf-8"><body style="font-family:system-ui;background:#141210;color:#EDE6DC;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;text-align:center"><div><h2 style="color:#E8A33D">${title}</h2><p>${msg}</p><p><a style="color:#4FB477" href="/">← Back to Foundry</a></p><script>setTimeout(()=>{try{location.href='/'}catch(e){}},2500)</script></div></body>`;
+    res.writeHead(err || !code ? 400 : 200, { 'Content-Type': 'text/html; charset=utf-8' });
+    if (err) return res.end(backHtml('TikTok connection cancelled', err));
+    if (!code || !oauthStates.has(st)) return res.end(backHtml('Connection failed', 'Invalid or expired request. Try Connect again.'));
+    oauthStates.delete(st);
+    try {
+      const tok = await tiktokExchangeCode(req, code);
+      const user = await tiktokUserInfo(tok.access_token).catch(() => ({}));
+      const label = (user && user.display_name) ? user.display_name : ('TikTok ' + (tok.open_id || '').slice(0, 6));
+      const existing = db.accounts.find((a) => a.openId && a.openId === (tok.open_id || user.open_id));
+      const acct = existing || { id: randomUUID().slice(0, 8), platform: 'tiktok', addedAt: Date.now() };
+      acct.label = label;
+      acct.accessToken = tok.access_token;
+      acct.refreshToken = tok.refresh_token || '';
+      acct.expiresAt = Date.now() + (tok.expires_in || 86400) * 1000;
+      acct.openId = tok.open_id || user.open_id || '';
+      acct.scopes = tok.scope || '';
+      if (!existing) db.accounts.push(acct);
+      if (!db.activeAccountId) db.activeAccountId = acct.id;
+      save();
+      return res.end(backHtml('Connected ✓', `${label} is now linked. Returning to Foundry…`));
+    } catch (e) {
+      return res.end(backHtml('Connection failed', String(e.message || e)));
+    }
   }
 
   // Briefs
@@ -590,6 +727,38 @@ async function route(pathname, method, req, res, helpers) {
       console.log('  (reel: generate failed:', e.message, ')');
       return json(res, 400, { error: e.message });
     }
+  }
+
+  // Auto-generate loop (start / stop)
+  if (pathname === '/api/reel/loop' && method === 'POST') {
+    const b = await readBody(req);
+    if (b.action === 'stop') {
+      db.reelLoop.active = false;
+      db.reelLoop.reason = 'stopped by you';
+      save();
+      return json(res, 200, { ok: true, reelLoop: db.reelLoop });
+    }
+    if (b.action === 'start') {
+      if (db.reelLoop.active) return json(res, 400, { error: 'A loop is already running. Stop it first.' });
+      if (!findBrief(b.briefId)) return json(res, 400, { error: 'Brief not found' });
+      if (!db.settings.anthropicKey) return json(res, 400, { error: 'Set your Anthropic API key in Settings first.' });
+      db.reelLoop = {
+        active: true, briefId: b.briefId, runs: 0,
+        maxRuns: Math.max(0, parseInt(b.maxRuns, 10) || 0),
+        maxMs: Math.max(0, parseFloat(b.maxMinutes) || 0) * 60000,
+        startedAt: Date.now(),
+        opts: {
+          hookStyle: b.hookStyle, format: b.format, formula: b.formula,
+          slideCount: b.slideCount, language: b.language,
+          includeImages: b.includeImages !== false, aspectRatio: b.aspectRatio,
+        },
+        reason: '', lastPostId: '',
+      };
+      save();
+      runReelLoop();   // detached — do not await
+      return json(res, 200, { ok: true, reelLoop: { active: true, runs: 0, maxRuns: db.reelLoop.maxRuns } });
+    }
+    return json(res, 400, { error: 'unknown loop action' });
   }
 
   // Regenerate a single slide's image
